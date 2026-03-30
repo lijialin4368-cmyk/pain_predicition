@@ -25,12 +25,7 @@ def parse_args():
         description="Train logistic regression model(s) for pain classification (0-3 vs 4-10)."
     )
     parser.add_argument("--input", type=Path, default=base_dir / "data_vectorized.csv", help="Input CSV path.")
-    parser.add_argument(
-        "--day",
-        type=str,
-        default="术后第一天",
-        help='Outcome day prefix, e.g. "术后第一天"; use "all" for all outcome days.',
-    )
+    parser.add_argument("--day", type=str, default="术后第一天", help='Outcome day prefix, e.g. "术后第一天".')
     parser.add_argument(
         "--pain-type",
         type=str,
@@ -59,7 +54,7 @@ def parse_args():
     parser.add_argument("--pain-threshold", type=float, default=4.0, help=">= threshold means class 1.")
     parser.add_argument("--test-size", type=float, default=0.2, help="Test set ratio.")
     parser.add_argument("--random-state", type=int, default=42, help="Random seed.")
-    parser.add_argument("--epochs", type=int, default=2000, help="Training epochs.")
+    parser.add_argument("--epochs", type=int, default=20000, help="Training epochs.")
     parser.add_argument("--batch-size", type=int, default=128, help="Mini-batch size.")
     parser.add_argument("--learning-rate", type=float, default=0.05, help="Learning rate.")
     parser.add_argument("--l2", type=float, default=1e-4, help="L2 regularization strength.")
@@ -243,8 +238,6 @@ def fit_logistic_regression_batch(
     patience: int,
     random_state: int,
     positive_weight_mode: str,
-    x_eval: np.ndarray = None,
-    y_eval: np.ndarray = None,
     verbose: bool = False,
 ):
     n_samples, n_features = x_train.shape
@@ -290,33 +283,10 @@ def fit_logistic_regression_batch(
         train_prob = sigmoid(x_train @ w + b)
         train_loss = binary_log_loss(y_train, train_prob) + 0.5 * l2 * float(np.sum(w * w))
         train_acc = float(np.mean((train_prob >= 0.5).astype(int) == y_train))
-
-        if x_eval is not None and y_eval is not None and len(y_eval) > 0:
-            eval_prob = sigmoid(x_eval @ w + b)
-            eval_loss = binary_log_loss(y_eval, eval_prob)
-            eval_acc = float(np.mean((eval_prob >= 0.5).astype(int) == y_eval))
-        else:
-            eval_loss = float("nan")
-            eval_acc = float("nan")
-
-        history.append(
-            {
-                "epoch": int(epoch),
-                "train_loss": float(train_loss),
-                "train_acc": train_acc,
-                "test_loss": float(eval_loss),
-                "test_acc": float(eval_acc),
-            }
-        )
+        history.append({"epoch": int(epoch), "train_loss": float(train_loss), "train_acc": train_acc})
 
         if verbose and (epoch == 1 or epoch % 100 == 0 or epoch == epochs):
-            if np.isnan(eval_acc):
-                print(f"[epoch {epoch:4d}] train_loss={train_loss:.6f} train_acc={train_acc:.4f}")
-            else:
-                print(
-                    f"[epoch {epoch:4d}] train_loss={train_loss:.6f} train_acc={train_acc:.4f} "
-                    f"test_acc={eval_acc:.4f}"
-                )
+            print(f"[epoch {epoch:4d}] train_loss={train_loss:.6f} train_acc={train_acc:.4f}")
 
         if best_loss - train_loss > 1e-8:
             best_loss = train_loss
@@ -446,30 +416,25 @@ def plot_confusion_matrix(cm: np.ndarray, title: str, out_file: Path):
     return True
 
 
-def plot_train_test_accuracy(history, title: str, out_file: Path):
+def plot_training_accuracy(history, title: str, out_file: Path):
     if not HAS_MATPLOTLIB:
         return False
     if len(history) == 0:
         return False
 
     epochs = [h["epoch"] for h in history]
-    train_accs = [h["train_acc"] for h in history]
-    test_accs = [h["test_acc"] for h in history]
+    accs = [h["train_acc"] for h in history]
 
     fig, ax = plt.subplots(figsize=(6.2, 4.2))
-    ax.plot(epochs, train_accs, color="#1f77b4", linewidth=2.0, label="Train Acc")
-    if not np.all(np.isnan(np.asarray(test_accs, dtype=float))):
-        ax.plot(epochs, test_accs, color="#ff7f0e", linewidth=2.0, label="Test Acc")
+    ax.plot(epochs, accs, color="#1f77b4", linewidth=2.0)
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Accuracy")
+    ax.set_ylabel("Train Accuracy")
     ax.set_ylim(0.0, 1.0)
     ax.set_title(title)
     ax.grid(True, linestyle="--", alpha=0.35)
-    ax.legend(loc="best")
     plt.tight_layout()
     out_file.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_file, dpi=180)
-    plt.close(fig)
     return True
 
 
@@ -514,8 +479,6 @@ def run_one_target(args, df: pd.DataFrame, target_col: str, output_dir: Path):
         patience=args.patience,
         random_state=args.random_state,
         positive_weight_mode=args.positive_weight_mode,
-        x_eval=x_test_std,
-        y_eval=y_test,
         verbose=args.verbose,
     )
 
@@ -537,9 +500,9 @@ def run_one_target(args, df: pd.DataFrame, target_col: str, output_dir: Path):
     cm = np.array([[metrics["tn"], metrics["fp"]], [metrics["fn"], metrics["tp"]]], dtype=int)
     cm_file = output_dir / f"confusion_matrix_{target_col}.png"
     plotted = plot_confusion_matrix(cm, title="Confusion Matrix", out_file=cm_file)
-    acc_curve_file = output_dir / f"train_test_acc_{target_col}.png"
-    acc_curve_plotted = plot_train_test_accuracy(
-        train_history, title=f"Train/Test Accuracy - {target_col}", out_file=acc_curve_file
+    acc_curve_file = output_dir / f"training_acc_{target_col}.png"
+    acc_curve_plotted = plot_training_accuracy(
+        train_history, title=f"Training Accuracy - {target_col}", out_file=acc_curve_file
     )
 
     if args.save_predictions:
@@ -621,9 +584,9 @@ def print_result(result: dict):
     else:
         print("Confusion matrix figure  : skipped (matplotlib unavailable)")
     if result["acc_curve_plotted"]:
-        print(f"Train/Test acc curve     : {result['acc_curve_file']}")
+        print(f"Training acc curve       : {result['acc_curve_file']}")
     else:
-        print("Train/Test acc curve     : skipped (matplotlib unavailable)")
+        print("Training acc curve       : skipped (matplotlib unavailable)")
     print("=" * 82)
 
 
@@ -632,27 +595,11 @@ def main():
     df = read_csv_with_fallback(args.input)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.day == "all":
-        selected_days = OUTCOME_DAYS
-    else:
-        if args.day not in OUTCOME_DAYS:
-            raise ValueError(f"--day must be one of {OUTCOME_DAYS + ['all']}, got: {args.day}")
-        selected_days = [args.day]
-
     targets = []
-    for day in selected_days:
-        if args.pain_type in ("rest", "both"):
-            targets.append(f"{day}_{PAIN_TYPES['rest']}")
-        if args.pain_type in ("movement", "both"):
-            targets.append(f"{day}_{PAIN_TYPES['movement']}")
-
-    available_targets = [t for t in targets if t in df.columns]
-    missing_targets = [t for t in targets if t not in df.columns]
-    if missing_targets:
-        print(f"Skipped missing targets  : {missing_targets}")
-    targets = available_targets
-    if not targets:
-        raise ValueError("No valid targets found in input file for current --day/--pain-type settings.")
+    if args.pain_type in ("rest", "both"):
+        targets.append(f"{args.day}_{PAIN_TYPES['rest']}")
+    if args.pain_type in ("movement", "both"):
+        targets.append(f"{args.day}_{PAIN_TYPES['movement']}")
 
     print(f"Input file               : {args.input}")
     print(f"Pain threshold rule      : 0-3 -> class 0, >= {args.pain_threshold} -> class 1")
@@ -664,7 +611,6 @@ def main():
         print("Note                     : Using other outcomes as features may inflate metrics.")
     if args.feature_mode == "temporal":
         print("Note                     : Temporal mode uses only earlier-day outcomes to avoid leakage.")
-    print(f"Selected days            : {selected_days}")
     print(f"Targets                  : {targets}")
     print(f"Output dir               : {args.output_dir}")
 

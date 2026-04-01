@@ -1,5 +1,6 @@
 import os
 import argparse
+import math
 from pathlib import Path
 
 import numpy as np
@@ -18,20 +19,75 @@ OUTCOME_DAYS = ["手术当天", "术后第一天", "术后第二天", "术后第
 OUTCOME_METRICS = ["静息痛", "活动痛", "镇静评分", "活动状态", "恶心呕吐"]
 PAIN_TYPES = {"rest": "静息痛", "movement": "活动痛"}
 
+DAY_EN = {
+    "手术当天": "SurgeryDay",
+    "术后第一天": "POD1",
+    "术后第二天": "POD2",
+    "术后第三天": "POD3",
+}
+
+METRIC_EN = {
+    "静息痛": "RestPain",
+    "活动痛": "MovementPain",
+    "镇静评分": "SedationScore",
+    "活动状态": "ActivityStatus",
+    "恶心呕吐": "NauseaVomiting",
+}
+
+METRIC_BINARY_SPECS = {
+    "静息痛": {
+        "positive_min": 4.0,
+        "low_label": "Class 0 (0-3)",
+        "high_label": "Class 1 (4-10)",
+    },
+    "活动痛": {
+        "positive_min": 4.0,
+        "low_label": "Class 0 (0-3)",
+        "high_label": "Class 1 (4-10)",
+    },
+    "镇静评分": {
+        "positive_min": 3.0,
+        "low_label": "Class 0 (1-2)",
+        "high_label": "Class 1 (3-5)",
+    },
+    "活动状态": {
+        "positive_min": 3.0,
+        "low_label": "Class 0 (1-2)",
+        "high_label": "Class 1 (3-4)",
+    },
+    "恶心呕吐": {
+        "positive_min": 2.0,
+        "low_label": "Class 0 (0-1)",
+        "high_label": "Class 1 (2-3)",
+    },
+}
+
+TOTAL_OUTPUT_FILES = {
+    "prediction_overview_all_targets.csv",
+    "confusion_matrix_prob_all_targets.csv",
+    "confusion_matrix_prob_all_targets.png",
+    "training_acc_all_targets.png",
+}
+
 
 def parse_args():
     base_dir = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(
-        description="Train logistic regression model(s) for pain classification (0-3 vs 4-10)."
+        description="Train logistic regression model(s) for outcome binary classification."
     )
     parser.add_argument("--input", type=Path, default=base_dir / "data_vectorized.csv", help="Input CSV path.")
-    parser.add_argument("--day", type=str, default="术后第一天", help='Outcome day prefix, e.g. "术后第一天".')
+    parser.add_argument(
+        "--day",
+        type=str,
+        default="术后第一天",
+        help='Outcome day prefix, e.g. "术后第一天"; use "all" for all days.',
+    )
     parser.add_argument(
         "--pain-type",
         type=str,
-        choices=["rest", "movement", "both"],
-        default="both",
-        help="Train on rest pain, movement pain, or both.",
+        choices=["rest", "movement", "both", "all"],
+        default="all",
+        help="rest/movement/both for pain-only, or all for all metrics.",
     )
     parser.add_argument(
         "--feature-mode",
@@ -51,10 +107,15 @@ def parse_args():
         default="median",
         help="How to impute missing feature values.",
     )
-    parser.add_argument("--pain-threshold", type=float, default=4.0, help=">= threshold means class 1.")
+    parser.add_argument(
+        "--pain-threshold",
+        type=float,
+        default=4.0,
+        help="Backward-compatible threshold for pain metrics (0-3 vs >=4).",
+    )
     parser.add_argument("--test-size", type=float, default=0.2, help="Test set ratio.")
     parser.add_argument("--random-state", type=int, default=42, help="Random seed.")
-    parser.add_argument("--epochs", type=int, default=20000, help="Training epochs.")
+    parser.add_argument("--epochs", type=int, default=2000, help="Training epochs.")
     parser.add_argument("--batch-size", type=int, default=128, help="Mini-batch size.")
     parser.add_argument("--learning-rate", type=float, default=0.05, help="Learning rate.")
     parser.add_argument("--l2", type=float, default=1e-4, help="L2 regularization strength.")
@@ -65,6 +126,29 @@ def parse_args():
         choices=["balanced", "none", "sqrt_balanced"],
         default="balanced",
         help="Class weighting for positive class in training batches.",
+    )
+    parser.add_argument(
+        "--disable-high-pain-oversampling",
+        action="store_true",
+        help="Disable oversampling for high-pain samples (> high-pain-score-threshold).",
+    )
+    parser.add_argument(
+        "--high-pain-oversample-factor",
+        type=float,
+        default=2.5,
+        help="Oversampling factor for high-pain samples in train set.",
+    )
+    parser.add_argument(
+        "--high-pain-loss-weight",
+        type=float,
+        default=2.0,
+        help="Extra loss weight for high-pain samples in train set.",
+    )
+    parser.add_argument(
+        "--high-pain-score-threshold",
+        type=float,
+        default=3.0,
+        help="Samples with score > threshold are treated as high pain for enhancement.",
     )
     parser.add_argument(
         "--threshold-strategy",
@@ -84,10 +168,9 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=base_dir / "baseline" / "logistic_outputs",
+        default=base_dir / "baseline" / "output_prediction_report_en",
         help="Directory to save confusion matrices and optional predictions.",
     )
-    parser.add_argument("--save-predictions", action="store_true", help="Save per-sample test predictions CSV.")
     return parser.parse_args()
 
 
@@ -115,6 +198,50 @@ def get_outcome_day_index(col: str):
         if col.startswith(f"{day}_"):
             return i
     return None
+
+
+def target_to_english_name(target_col: str):
+    for day in OUTCOME_DAYS:
+        prefix = f"{day}_"
+        if target_col.startswith(prefix):
+            metric = target_col[len(prefix) :]
+            day_en = DAY_EN.get(day, day)
+            metric_en = METRIC_EN.get(metric, metric)
+            return f"{day_en}_{metric_en}"
+    return target_col
+
+
+def split_day_metric(target_col: str):
+    for day in OUTCOME_DAYS:
+        prefix = f"{day}_"
+        if target_col.startswith(prefix):
+            return day, target_col[len(prefix) :]
+    return "", target_col
+
+
+def is_rest_or_movement_target(target_col: str):
+    _, metric = split_day_metric(target_col)
+    return metric in ("静息痛", "活动痛")
+
+
+def get_metric_binary_spec(metric: str):
+    if metric not in METRIC_BINARY_SPECS:
+        raise ValueError(f"Unsupported metric for binary classification: {metric}")
+    return METRIC_BINARY_SPECS[metric]
+
+
+def make_binary_target(target_col: str, y_score: np.ndarray, args):
+    _, metric = split_day_metric(target_col)
+    spec = get_metric_binary_spec(metric)
+
+    positive_min = float(spec["positive_min"])
+    if metric in ("静息痛", "活动痛"):
+        positive_min = float(args.pain_threshold)
+
+    y_bin = (y_score >= positive_min).astype(int)
+    low_label = spec["low_label"]
+    high_label = spec["high_label"]
+    return y_bin, positive_min, low_label, high_label
 
 
 def select_feature_columns(df: pd.DataFrame, target_col: str, feature_mode: str):
@@ -228,9 +355,40 @@ def binary_log_loss(y_true: np.ndarray, y_prob: np.ndarray):
     return float(-np.mean(y_true * np.log(p) + (1.0 - y_true) * np.log(1.0 - p)))
 
 
+def weighted_binary_log_loss(y_true: np.ndarray, y_prob: np.ndarray, sample_weight: np.ndarray):
+    eps = 1e-12
+    p = np.clip(y_prob, eps, 1.0 - eps)
+    sw = np.clip(sample_weight.astype(float), 0.0, None)
+    sw_sum = float(np.sum(sw))
+    if sw_sum <= 0.0:
+        return binary_log_loss(y_true, y_prob)
+    loss_vec = -(y_true * np.log(p) + (1.0 - y_true) * np.log(1.0 - p))
+    return float(np.sum(loss_vec * sw) / sw_sum)
+
+
+def build_high_pain_training_weights(args, target_col: str, train_scores: np.ndarray):
+    n = len(train_scores)
+    loss_w = np.ones(n, dtype=float)
+    over_w = np.ones(n, dtype=float)
+    high_mask = np.zeros(n, dtype=bool)
+
+    if not is_rest_or_movement_target(target_col):
+        return loss_w, over_w, high_mask
+
+    high_mask = train_scores > args.high_pain_score_threshold
+    if np.any(high_mask):
+        loss_w[high_mask] = max(1.0, float(args.high_pain_loss_weight))
+        over_w[high_mask] = max(1.0, float(args.high_pain_oversample_factor))
+
+    return loss_w, over_w, high_mask
+
+
 def fit_logistic_regression_batch(
     x_train: np.ndarray,
     y_train: np.ndarray,
+    train_sample_weight: np.ndarray,
+    oversample_weight: np.ndarray,
+    use_high_pain_oversampling: bool,
     epochs: int,
     batch_size: int,
     learning_rate: float,
@@ -252,12 +410,22 @@ def fit_logistic_regression_batch(
     history = []
 
     batch_size = max(1, min(batch_size, n_samples))
+    over_prob = np.clip(oversample_weight.astype(float), 0.0, None)
+    if float(np.sum(over_prob)) <= 0:
+        over_prob = np.ones(n_samples, dtype=float)
+    over_prob = over_prob / np.sum(over_prob)
+
     for epoch in range(1, epochs + 1):
-        order = rng.permutation(n_samples)
+        if use_high_pain_oversampling:
+            order = rng.choice(n_samples, size=n_samples, replace=True, p=over_prob)
+        else:
+            order = rng.permutation(n_samples)
+
         for start in range(0, n_samples, batch_size):
             idx = order[start : start + batch_size]
             xb = x_train[idx]
             yb = y_train[idx]
+            sw = train_sample_weight[idx]
 
             prob = sigmoid(xb @ w + b)
 
@@ -270,18 +438,32 @@ def fit_logistic_regression_batch(
             else:
                 pos_weight = 1.0
 
-            weight = np.where(yb == 1, pos_weight, 1.0)
-            weight = weight / (pos_weight + 1.0) #改
-            error = (prob - yb) * weight
+            class_weight = np.where(yb == 1, pos_weight, 1.0)
+            weight = class_weight * sw
+            weight_sum = float(np.sum(weight))
+            if weight_sum <= 0.0:
+                weight = np.ones_like(weight)
+                weight_sum = float(len(weight))
 
-            grad_w = (xb.T @ error) / len(idx) + l2 * w
-            grad_b = float(np.mean(error))
+            error = (prob - yb) * weight
+            grad_w = (xb.T @ error) / weight_sum + l2 * w
+            grad_b = float(np.sum(error) / weight_sum)
 
             w -= learning_rate * grad_w
             b -= learning_rate * grad_b
 
         train_prob = sigmoid(x_train @ w + b)
-        train_loss = binary_log_loss(y_train, train_prob) + 0.5 * l2 * float(np.sum(w * w))
+        pos_all = np.sum(y_train == 1)
+        neg_all = np.sum(y_train == 0)
+        if positive_weight_mode == "balanced":
+            pos_weight_all = min(neg_all / (pos_all + 1e-8), 10.0)
+        elif positive_weight_mode == "sqrt_balanced":
+            pos_weight_all = min(np.sqrt(neg_all / (pos_all + 1e-8)), 10.0)
+        else:
+            pos_weight_all = 1.0
+        class_weight_all = np.where(y_train == 1, pos_weight_all, 1.0)
+        eval_weight = train_sample_weight * class_weight_all
+        train_loss = weighted_binary_log_loss(y_train, train_prob, eval_weight) + 0.5 * l2 * float(np.sum(w * w))
         train_acc = float(np.mean((train_prob >= 0.5).astype(int) == y_train))
         history.append({"epoch": int(epoch), "train_loss": float(train_loss), "train_acc": train_acc})
 
@@ -390,22 +572,28 @@ def choose_threshold_by_validation(args, y_val: np.ndarray, prob_val: np.ndarray
     return best[1], best[2], base, "fallback_objective"
 
 
-def plot_confusion_matrix(cm: np.ndarray, title: str, out_file: Path):
+def row_normalize_cm(cm: np.ndarray):
+    row_sum = cm.sum(axis=1, keepdims=True).astype(float)
+    row_sum[row_sum == 0.0] = 1.0
+    return cm.astype(float) / row_sum
+
+
+def plot_confusion_matrix_prob(cm_prob: np.ndarray, low_label: str, high_label: str, title: str, out_file: Path):
     if not HAS_MATPLOTLIB:
         return False
 
     fig, ax = plt.subplots(figsize=(4.8, 4.2))
-    im = ax.imshow(cm, cmap="Blues")
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    im = ax.imshow(cm_prob, cmap="Blues", vmin=0.0, vmax=1.0)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Probability")
     ax.set_xticks([0, 1])
     ax.set_yticks([0, 1])
-    ax.set_xticklabels(["Pred 0", "Pred 1"])
-    ax.set_yticklabels(["True 0", "True 1"])
+    ax.set_xticklabels([f"Pred {low_label}", f"Pred {high_label}"])
+    ax.set_yticklabels([f"True {low_label}", f"True {high_label}"])
     ax.set_title(title)
 
     for i in range(2):
         for j in range(2):
-            ax.text(j, i, str(int(cm[i, j])), ha="center", va="center", color="black", fontsize=12)
+            ax.text(j, i, f"{cm_prob[i, j] * 100:.1f}%", ha="center", va="center", color="black", fontsize=11)
 
     ax.set_xlabel("Predicted")
     ax.set_ylabel("Actual")
@@ -435,7 +623,158 @@ def plot_training_accuracy(history, title: str, out_file: Path):
     plt.tight_layout()
     out_file.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_file, dpi=180)
+    plt.close(fig)
     return True
+
+
+def plot_training_accuracy_grid(results, out_file: Path):
+    if not HAS_MATPLOTLIB:
+        return False
+    if len(results) == 0:
+        return False
+
+    n = len(results)
+    n_cols = min(4, n)
+    n_rows = int(math.ceil(n / n_cols))
+
+    fig_w = max(9.0, 4.8 * n_cols)
+    fig_h = max(5.0, 4.0 * n_rows + 0.8)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_w, fig_h), constrained_layout=True)
+
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([[axes]])
+    elif n_rows == 1:
+        axes = np.array([axes])
+    elif n_cols == 1:
+        axes = np.array([[ax] for ax in axes])
+
+    for k, result in enumerate(results):
+        r = k // n_cols
+        c = k % n_cols
+        ax = axes[r, c]
+
+        history = result.get("train_history", [])
+        if len(history) == 0:
+            ax.set_title(result["target_en"], fontsize=11, pad=8)
+            ax.text(0.5, 0.5, "No history", ha="center", va="center", fontsize=10)
+            ax.set_axis_off()
+            continue
+
+        epochs = [h["epoch"] for h in history]
+        accs = [h["train_acc"] for h in history]
+        ax.plot(epochs, accs, color="#1f77b4", linewidth=1.8)
+        ax.set_title(result["target_en"], fontsize=11, pad=8)
+        ax.set_xlabel("Epoch", fontsize=9)
+        ax.set_ylabel("Train Accuracy", fontsize=9)
+        ax.set_ylim(0.0, 1.0)
+        ax.tick_params(labelsize=8)
+        ax.grid(True, linestyle="--", alpha=0.35)
+
+    for k in range(n, n_rows * n_cols):
+        r = k // n_cols
+        c = k % n_cols
+        axes[r, c].axis("off")
+
+    fig.suptitle("Training Accuracy Curves (All Targets)", fontsize=14)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_file, dpi=200)
+    plt.close(fig)
+    return True
+
+
+def plot_confusion_matrices_grid(results, out_file: Path):
+    if not HAS_MATPLOTLIB:
+        return False
+    if len(results) == 0:
+        return False
+
+    n = len(results)
+    n_cols = min(4, n)
+    n_rows = int(math.ceil(n / n_cols))
+
+    fig_w = max(9.0, 4.6 * n_cols)
+    fig_h = max(4.8, 4.2 * n_rows + 0.8)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_w, fig_h), constrained_layout=True)
+
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([[axes]])
+    elif n_rows == 1:
+        axes = np.array([axes])
+    elif n_cols == 1:
+        axes = np.array([[ax] for ax in axes])
+
+    im = None
+    for k, result in enumerate(results):
+        r = k // n_cols
+        c = k % n_cols
+        ax = axes[r, c]
+
+        cm_prob = result["cm_prob"]
+        low_label = result["low_label"]
+        high_label = result["high_label"]
+        im = ax.imshow(cm_prob, cmap="Blues", vmin=0.0, vmax=1.0)
+        ax.set_title(result["target_en"], fontsize=11, pad=8)
+        ax.set_xticks([0, 1])
+        ax.set_yticks([0, 1])
+        ax.set_xticklabels([f"Pred {low_label}", f"Pred {high_label}"], fontsize=8, rotation=16, ha="right")
+        ax.set_yticklabels([f"True {low_label}", f"True {high_label}"], fontsize=8)
+        ax.set_xlabel("Predicted", fontsize=9)
+        ax.set_ylabel("Actual", fontsize=9)
+
+        for i in range(2):
+            for j in range(2):
+                ax.text(j, i, f"{cm_prob[i, j] * 100:.1f}%", ha="center", va="center", color="black", fontsize=10)
+
+    for k in range(n, n_rows * n_cols):
+        r = k // n_cols
+        c = k % n_cols
+        axes[r, c].axis("off")
+
+    if im is not None:
+        cbar = fig.colorbar(im, ax=axes.ravel().tolist(), fraction=0.025, pad=0.015)
+        cbar.set_label("Row Probability", fontsize=10)
+
+    fig.suptitle("Confusion Matrices (Row-normalized Probabilities)", fontsize=14)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out_file, dpi=200)
+    plt.close(fig)
+    return True
+
+
+def save_combined_confusion_csv(results, out_file: Path):
+    rows = []
+    for result in results:
+        cm_prob = result["cm_prob"]
+        cm_count = result["cm_count"]
+        m = result["metrics"]
+        rows.append(
+            {
+                "target": result["target_en"],
+                "class_0_label": result["low_label"],
+                "class_1_label": result["high_label"],
+                "p_true_low_pred_low": float(cm_prob[0, 0]),
+                "p_true_low_pred_high": float(cm_prob[0, 1]),
+                "p_true_high_pred_low": float(cm_prob[1, 0]),
+                "p_true_high_pred_high": float(cm_prob[1, 1]),
+                "count_true_low_pred_low": int(cm_count[0, 0]),
+                "count_true_low_pred_high": int(cm_count[0, 1]),
+                "count_true_high_pred_low": int(cm_count[1, 0]),
+                "count_true_high_pred_high": int(cm_count[1, 1]),
+                "auc": float(m["auc"]),
+                "accuracy": float(m["accuracy"]),
+                "precision": float(m["precision"]),
+                "recall": float(m["recall"]),
+                "specificity": float(m["specificity"]),
+                "fpr": float(m["fpr"]),
+                "f1": float(m["f1"]),
+                "log_loss": float(m["log_loss"]),
+                "brier": float(m["brier"]),
+            }
+        )
+
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(out_file, index=False, encoding="utf-8-sig")
+    return out_file
 
 
 def run_one_target(args, df: pd.DataFrame, target_col: str, output_dir: Path):
@@ -451,7 +790,7 @@ def run_one_target(args, df: pd.DataFrame, target_col: str, output_dir: Path):
     valid_mask = y_raw.notna()
     x_df = x_df.loc[valid_mask].reset_index(drop=True)
     y_score = y_raw.loc[valid_mask].to_numpy(dtype=float)
-    y_bin = (y_score >= args.pain_threshold).astype(int)
+    y_bin, positive_min, low_label, high_label = make_binary_target(target_col, y_score, args)
 
     if len(np.unique(y_bin)) < 2:
         raise ValueError(f"Target {target_col} has only one class after missing drop.")
@@ -460,18 +799,25 @@ def run_one_target(args, df: pd.DataFrame, target_col: str, output_dir: Path):
     train_idx, test_idx = split_train_test_stratified(y_bin, args.test_size, args.random_state)
     x_train_all, x_test = x[train_idx], x[test_idx]
     y_train_all, y_test = y_bin[train_idx], y_bin[test_idx]
-    score_test = y_score[test_idx]
+    score_train_all = y_score[train_idx]
 
     # Validation split for threshold tuning to reduce false positives without overfitting test.
     tr_sub_idx, val_idx = split_train_val_stratified(y_train_all, args.val_size, args.random_state + 17)
     x_train, y_train = x_train_all[tr_sub_idx], y_train_all[tr_sub_idx]
     x_val, y_val = x_train_all[val_idx], y_train_all[val_idx]
+    score_train = score_train_all[tr_sub_idx]
+    train_sample_weight, oversample_weight, high_mask_train = build_high_pain_training_weights(
+        args, target_col=target_col, train_scores=score_train
+    )
 
     x_train_std, x_test_std = standardize_train_test(x_train, x_test)
     _, x_val_std = standardize_train_test(x_train, x_val)
     w, b, train_loss, train_history = fit_logistic_regression_batch(
         x_train=x_train_std,
         y_train=y_train,
+        train_sample_weight=train_sample_weight,
+        oversample_weight=oversample_weight,
+        use_high_pain_oversampling=(not args.disable_high_pain_oversampling),
         epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
@@ -496,26 +842,10 @@ def run_one_target(args, df: pd.DataFrame, target_col: str, output_dir: Path):
         )
 
     metrics = classification_metrics(y_test, test_prob, threshold=chosen_threshold)
+    target_en = target_to_english_name(target_col)
 
-    cm = np.array([[metrics["tn"], metrics["fp"]], [metrics["fn"], metrics["tp"]]], dtype=int)
-    cm_file = output_dir / f"confusion_matrix_{target_col}.png"
-    plotted = plot_confusion_matrix(cm, title="Confusion Matrix", out_file=cm_file)
-    acc_curve_file = output_dir / f"training_acc_{target_col}.png"
-    acc_curve_plotted = plot_training_accuracy(
-        train_history, title=f"Training Accuracy - {target_col}", out_file=acc_curve_file
-    )
-
-    if args.save_predictions:
-        pred_df = pd.DataFrame(
-            {
-                "target_score": score_test,
-                "y_true": y_test,
-                "y_prob": test_prob,
-                "y_pred": metrics["y_pred"],
-                "decision_threshold": chosen_threshold,
-            }
-        )
-        pred_df.to_csv(output_dir / f"predictions_{target_col}.csv", index=False, encoding="utf-8-sig")
+    cm_count = np.array([[metrics["tn"], metrics["fp"]], [metrics["fn"], metrics["tp"]]], dtype=int)
+    cm_prob = row_normalize_cm(cm_count)
 
     return {
         "target_col": target_col,
@@ -523,9 +853,14 @@ def run_one_target(args, df: pd.DataFrame, target_col: str, output_dir: Path):
         "n_train": int(len(train_idx)),
         "n_test": int(len(test_idx)),
         "n_pos_train": int(np.sum(y_train)),
+        "n_high_pain_train": int(np.sum(high_mask_train)),
         "n_val": int(len(y_val)),
         "n_pos_val": int(np.sum(y_val)) if len(y_val) > 0 else 0,
         "n_pos_test": int(np.sum(y_test)),
+        "avg_train_sample_weight": float(np.mean(train_sample_weight)) if len(train_sample_weight) > 0 else 1.0,
+        "class_1_min_score": float(positive_min),
+        "low_label": low_label,
+        "high_label": high_label,
         "feature_count": int(len(feature_cols)),
         "train_loss": float(train_loss),
         "chosen_threshold": float(chosen_threshold),
@@ -533,22 +868,24 @@ def run_one_target(args, df: pd.DataFrame, target_col: str, output_dir: Path):
         "val_metrics_base": val_base,
         "val_metrics_selected": val_selected,
         "metrics": metrics,
-        "cm": cm,
-        "cm_file": cm_file,
-        "cm_plotted": plotted,
-        "acc_curve_file": acc_curve_file,
-        "acc_curve_plotted": acc_curve_plotted,
+        "target_en": target_en,
+        "cm_count": cm_count,
+        "cm_prob": cm_prob,
+        "train_history": train_history,
     }
 
 
 def print_result(result: dict):
     m = result["metrics"]
     print("=" * 82)
-    print(f"Target: {result['target_col']}")
+    print(f"Target: {result['target_col']} ({result['target_en']})")
     print("=" * 82)
     print(f"Samples (non-missing)    : {result['n_total_non_missing']}")
     print(f"Train / Val / Test       : {result['n_train']} / {result['n_val']} / {result['n_test']}")
     print(f"Pos in Train/Val/Test    : {result['n_pos_train']} / {result['n_pos_val']} / {result['n_pos_test']}")
+    print(f"Class split              : {result['low_label']} vs {result['high_label']}")
+    print(f"High pain in train (>3)  : {result['n_high_pain_train']}")
+    print(f"Avg train sample weight  : {result['avg_train_sample_weight']:.3f}")
     print(f"Feature count            : {result['feature_count']}")
     print(f"Train loss (BCE+L2)      : {result['train_loss']:.6f}")
     print(
@@ -576,18 +913,22 @@ def print_result(result: dict):
     print(f"Log Loss                 : {m['log_loss']:.4f}")
     print(f"Brier Score              : {m['brier']:.4f}")
     print("-" * 82)
-    print("Confusion Matrix (rows=true [0,1], cols=pred [0,1])")
-    print(f"[[{m['tn']}, {m['fp']}],")
-    print(f" [{m['fn']}, {m['tp']}]]")
-    if result["cm_plotted"]:
-        print(f"Confusion matrix figure  : {result['cm_file']}")
-    else:
-        print("Confusion matrix figure  : skipped (matplotlib unavailable)")
-    if result["acc_curve_plotted"]:
-        print(f"Training acc curve       : {result['acc_curve_file']}")
-    else:
-        print("Training acc curve       : skipped (matplotlib unavailable)")
+    print(
+        "Confusion Matrix Prob "
+        f"(rows=true [{result['low_label']}, {result['high_label']}], "
+        f"cols=pred [{result['low_label']}, {result['high_label']}])"
+    )
+    cm_prob = result["cm_prob"]
+    print(f"[[{cm_prob[0,0]:.4f}, {cm_prob[0,1]:.4f}],")
+    print(f" [{cm_prob[1,0]:.4f}, {cm_prob[1,1]:.4f}]]")
     print("=" * 82)
+
+
+def cleanup_output_dir_keep_totals(output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for p in output_dir.iterdir():
+        if p.is_file() and p.name not in TOTAL_OUTPUT_FILES:
+            p.unlink()
 
 
 def main():
@@ -595,16 +936,37 @@ def main():
     df = read_csv_with_fallback(args.input)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    targets = []
-    if args.pain_type in ("rest", "both"):
-        targets.append(f"{args.day}_{PAIN_TYPES['rest']}")
-    if args.pain_type in ("movement", "both"):
-        targets.append(f"{args.day}_{PAIN_TYPES['movement']}")
+    if args.day == "all":
+        day_candidates = OUTCOME_DAYS
+    else:
+        if args.day not in OUTCOME_DAYS:
+            raise ValueError(f'Unknown day: {args.day}. Use one of {OUTCOME_DAYS} or "all".')
+        day_candidates = [args.day]
+
+    if args.pain_type == "rest":
+        selected_metrics = ["静息痛"]
+    elif args.pain_type == "movement":
+        selected_metrics = ["活动痛"]
+    elif args.pain_type == "both":
+        selected_metrics = ["静息痛", "活动痛"]
+    else:
+        selected_metrics = list(OUTCOME_METRICS)
+
+    target_candidates = [f"{day}_{metric}" for day in day_candidates for metric in selected_metrics]
+    targets = [c for c in target_candidates if c in df.columns]
+    missing_targets = [c for c in target_candidates if c not in df.columns]
+    if len(targets) == 0:
+        raise ValueError("No valid target columns found for current settings.")
 
     print(f"Input file               : {args.input}")
     print(f"Pain threshold rule      : 0-3 -> class 0, >= {args.pain_threshold} -> class 1")
+    print("Other metric bins        : Sedation 1-2/3-5, Activity 1-2/3-4, Nausea 0-1/2-3")
     print("Missing outcome handling : drop missing rows before train/test split and batch training")
     print(f"Positive weight mode     : {args.positive_weight_mode}")
+    print(f"High pain oversampling   : {not args.disable_high_pain_oversampling}")
+    print(f"High pain score threshold: > {args.high_pain_score_threshold}")
+    print(f"High pain oversample fac.: {args.high_pain_oversample_factor}")
+    print(f"High pain loss weight    : {args.high_pain_loss_weight}")
     print(f"Threshold strategy       : {args.threshold_strategy}")
     print(f"Feature mode             : {args.feature_mode}")
     if args.feature_mode == "all":
@@ -612,17 +974,23 @@ def main():
     if args.feature_mode == "temporal":
         print("Note                     : Temporal mode uses only earlier-day outcomes to avoid leakage.")
     print(f"Targets                  : {targets}")
+    if missing_targets:
+        print(f"Missing targets skipped  : {missing_targets}")
     print(f"Output dir               : {args.output_dir}")
 
     all_rows = []
+    all_results = []
     for target_col in targets:
         result = run_one_target(args, df, target_col=target_col, output_dir=args.output_dir)
         print_result(result)
+        all_results.append(result)
 
         m = result["metrics"]
         all_rows.append(
             {
-                "target_col": target_col,
+                "target": result["target_en"],
+                "class_0_label": result["low_label"],
+                "class_1_label": result["high_label"],
                 "auc": m["auc"],
                 "accuracy": m["accuracy"],
                 "precision": m["precision"],
@@ -642,13 +1010,38 @@ def main():
                 "n_test": result["n_test"],
                 "chosen_threshold": result["chosen_threshold"],
                 "train_loss": result["train_loss"],
+                "p_true_low_pred_low": result["cm_prob"][0, 0],
+                "p_true_low_pred_high": result["cm_prob"][0, 1],
+                "p_true_high_pred_low": result["cm_prob"][1, 0],
+                "p_true_high_pred_high": result["cm_prob"][1, 1],
             }
         )
 
     summary_df = pd.DataFrame(all_rows)
-    summary_file = args.output_dir / "metrics_summary.csv"
+    summary_file = args.output_dir / "prediction_overview_all_targets.csv"
     summary_df.to_csv(summary_file, index=False, encoding="utf-8-sig")
     print(f"Saved summary metrics    : {summary_file}")
+
+    combined_cm_csv = args.output_dir / "confusion_matrix_prob_all_targets.csv"
+    save_combined_confusion_csv(all_results, combined_cm_csv)
+    print(f"Saved combined CM CSV    : {combined_cm_csv}")
+
+    combined_cm_fig = args.output_dir / "confusion_matrix_prob_all_targets.png"
+    grid_plotted = plot_confusion_matrices_grid(all_results, combined_cm_fig)
+    if grid_plotted:
+        print(f"Saved combined CM figure : {combined_cm_fig}")
+    else:
+        print("Saved combined CM figure : skipped (matplotlib unavailable)")
+
+    combined_acc_fig = args.output_dir / "training_acc_all_targets.png"
+    acc_grid_plotted = plot_training_accuracy_grid(all_results, combined_acc_fig)
+    if acc_grid_plotted:
+        print(f"Saved combined ACC figure: {combined_acc_fig}")
+    else:
+        print("Saved combined ACC figure: skipped (matplotlib unavailable)")
+
+    cleanup_output_dir_keep_totals(args.output_dir)
+    print(f"Cleaned output dir       : kept only total CSV/PNG files in {args.output_dir}")
 
 
 if __name__ == "__main__":

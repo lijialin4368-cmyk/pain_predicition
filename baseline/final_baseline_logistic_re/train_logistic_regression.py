@@ -71,11 +71,21 @@ TOTAL_OUTPUT_FILES = {
 
 
 def parse_args():
-    base_dir = Path(__file__).resolve().parents[1]
+    script_dir = Path(__file__).resolve().parent
+    baseline_dir = script_dir.parent
+    project_dir = baseline_dir.parent
+
+    default_input_candidates = [
+        project_dir / "data_vectorized.csv",
+        baseline_dir / "data_vectorized.csv",
+        script_dir / "data_vectorized.csv",
+    ]
+    default_input = next((p for p in default_input_candidates if p.exists()), default_input_candidates[0])
+
     parser = argparse.ArgumentParser(
         description="Train logistic regression model(s) for outcome binary classification."
     )
-    parser.add_argument("--input", type=Path, default=base_dir / "data_vectorized.csv", help="Input CSV path.")
+    parser.add_argument("--input", type=Path, default=default_input, help="Input CSV path.")
     parser.add_argument(
         "--day",
         type=str,
@@ -168,13 +178,16 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=base_dir / "baseline" / "output_prediction_report_en",
+        default=script_dir / "output_prediction_report_en",
         help="Directory to save confusion matrices and optional predictions.",
     )
     return parser.parse_args()
 
 
 def read_csv_with_fallback(path: Path) -> pd.DataFrame:
+    path = path.expanduser().resolve()
+    if not path.exists():
+        raise RuntimeError(f"Cannot read CSV (file not found): {path}")
     for enc in ("utf-8", "utf-8-sig", "gbk"):
         try:
             return pd.read_csv(path, encoding=enc)

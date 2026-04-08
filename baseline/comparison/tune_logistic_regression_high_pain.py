@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -74,7 +75,38 @@ def parse_args():
         default=[],
         help="Extra args forwarded to train_logistic_regression.py (must be placed after --extra-args).",
     )
+    parser.add_argument(
+        "--train-script",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to train_logistic_regression.py. "
+            "If omitted, the script tries common project locations automatically."
+        ),
+    )
     return parser.parse_args()
+
+
+def resolve_train_script(script_dir: Path, user_path: Optional[Path]) -> Path:
+    if user_path is not None:
+        train_script = user_path.expanduser().resolve()
+        if not train_script.exists():
+            raise FileNotFoundError(f"train script not found: {train_script}")
+        return train_script
+
+    candidates = [
+        script_dir / "train_logistic_regression.py",
+        script_dir.parent / "final_baseline_logistic_re" / "train_logistic_regression.py",
+        script_dir.parent / "train_logistic_regression.py",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+
+    raise FileNotFoundError(
+        "Cannot find train_logistic_regression.py. Tried:\n- "
+        + "\n- ".join(str(p) for p in candidates)
+    )
 
 
 def summarize_prediction_overview(csv_path: Path):
@@ -192,7 +224,7 @@ def write_markdown_report(md_path: Path, all_rows: pd.DataFrame, ok_rows: pd.Dat
 def main():
     args = parse_args()
     script_dir = Path(__file__).resolve().parent
-    train_script = script_dir / "train_logistic_regression.py"
+    train_script = resolve_train_script(script_dir=script_dir, user_path=args.train_script)
 
     output_root = args.output_root.resolve()
     runs_root = output_root / "runs"

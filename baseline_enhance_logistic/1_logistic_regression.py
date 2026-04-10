@@ -701,7 +701,17 @@ def fit_shared_backbone_multitask(
         pred_all = (prob_all >= 0.5).astype(float)
         correct = (pred_all == y_filled) & label_mask
         train_acc = float(np.sum(correct) / max(1.0, float(np.sum(label_mask))))
-        history.append({"epoch": int(epoch), "train_loss": train_loss, "train_acc": train_acc})
+        head_correct = np.sum(correct, axis=0).astype(float)
+        head_total = np.sum(label_mask, axis=0).astype(float)
+        head_acc = np.divide(head_correct, np.maximum(1.0, head_total))
+        history.append(
+            {
+                "epoch": int(epoch),
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "head_train_acc": head_acc.tolist(),
+            }
+        )
 
         if args.verbose and (epoch == 1 or epoch % 100 == 0 or epoch == int(args.epochs)):
             print(f"[epoch {epoch:4d}] train_loss={train_loss:.6f} train_acc={train_acc:.4f}")
@@ -1275,6 +1285,21 @@ def run_shared_backbone_targets(args, df: pd.DataFrame, targets):
         if is_rest_or_movement_target(target_col):
             high_mask_h = train_mask_h & (train_score_h > args.high_pain_score_threshold)
 
+        task_train_history = []
+        for hh in train_history:
+            head_acc_list = hh.get("head_train_acc", None)
+            if isinstance(head_acc_list, list) and h < len(head_acc_list):
+                task_acc = float(head_acc_list[h])
+            else:
+                task_acc = float(hh.get("train_acc", 0.0))
+            task_train_history.append(
+                {
+                    "epoch": int(hh["epoch"]),
+                    "train_loss": float(hh["train_loss"]),
+                    "train_acc": task_acc,
+                }
+            )
+
         results.append(
             {
                 "target_col": target_col,
@@ -1300,7 +1325,7 @@ def run_shared_backbone_targets(args, df: pd.DataFrame, targets):
                 "target_en": target_to_english_name(target_col),
                 "cm_count": cm_count,
                 "cm_prob": cm_prob,
-                "train_history": train_history,
+                "train_history": task_train_history,
                 "metric_name": metric,
                 "oversampling_used": bool(oversampling_used),
             }

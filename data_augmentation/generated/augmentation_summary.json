@@ -1,0 +1,41 @@
+{
+  "source_rows": 2689,
+  "heldout_size_fraction": 0.3,
+  "test_size_fraction": 0.3,
+  "random_state": 42,
+  "train_original_rows": 1882,
+  "heldout_original_rows": 807,
+  "test_original_rows": 807,
+  "generated_rows": 4964,
+  "final_rows": 7653,
+  "male_code": 1,
+  "same_day_trigger_columns": [
+    "手术当天_静息痛",
+    "手术当天_活动痛"
+  ],
+  "high_pain_total_candidates_per_parent": 49,
+  "high_pain_kept_per_parent": 10,
+  "generated_postprocess": {
+    "raw_generated_rows": 4964,
+    "deduplicated_generated_rows": 4964,
+    "generated_keep_fraction": 1.0,
+    "final_generated_rows": 4964,
+    "deduplicate_generated_rows": true
+  },
+  "generated_rule_counts": {
+    "high_pain_original_jitter": 2392,
+    "high_pain_upshift_jitter": 2488,
+    "movement_wave_down": 36,
+    "movement_wave_up": 36,
+    "rest_wave_down": 6,
+    "rest_wave_up": 6
+  },
+  "generated_parent_counts": {
+    "high_pain_original_jitter": 488,
+    "high_pain_upshift_jitter": 488,
+    "movement_wave_down": 36,
+    "movement_wave_up": 36,
+    "rest_wave_down": 6,
+    "rest_wave_up": 6
+  }
+}

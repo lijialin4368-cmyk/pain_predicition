@@ -13,6 +13,7 @@ pain_prediction/randomforest/
 ├── visualize_outputs.py              # 基于输出文件绘图
 ├── artifacts/
 │   └── rf_regressor.joblib           # 训练后保存的模型文件
+├── artifacts_comparison/             # “直接复制样本”对比组模型文件
 └── outputs/
     ├── metrics.json                  # 回归指标（MAE/RMSE/R2）
     ├── test_predictions.csv          # 测试集真实值与预测值
@@ -20,6 +21,14 @@ pain_prediction/randomforest/
     ├── rf_search_results.csv         # 随机搜索每组参数的CV结果
     ├── inference_predictions.csv     # 全量数据推理结果（来自 predict.py）
     └── plots/                        # 可视化图片输出目录
+
+pain_prediction/randomforest/outputs_comparison/
+├── metrics.json                      # “直接复制样本”对比组指标
+├── test_predictions.csv              # “直接复制样本”对比组测试集预测
+├── feature_importance.csv            # “直接复制样本”对比组特征重要性
+├── rf_search_results.csv             # “直接复制样本”对比组调参结果
+├── inference_predictions.csv         # “直接复制样本”对比组全量推理结果
+└── plots/                            # “直接复制样本”对比组可视化
 ```
 
 ## 2. 快速开始
@@ -73,6 +82,16 @@ cd pain_prediction
 pixi run rf-plot
 ```
 
+如果你想运行“直接复制样本”对比组，对应命令是：
+
+```bash
+cd pain_prediction
+pixi run augment-data-comparison
+pixi run rf-train-comparison
+pixi run rf-plot-comparison
+pixi run rf-predict-comparison
+```
+
 ## 3. 数据调用规则
 
 推荐把输入数据路径显式写在命令里，这样最不容易混淆：
@@ -106,7 +125,80 @@ pixi run python3 randomforest/train_random_forest_regression.py \
 
 `config.py` 里的 `TEST_SIZE` 只会在输入数据中没有显式测试集标记时才作为兜底拆分比例生效。
 
-## 4. 你最可能手动调整的地方
+## 4. 目录与实验对应关系
+
+这个仓库里和随机森林相关的结果目录不止一个，最容易混淆的是下面这几类：
+
+### 4.1 `randomforest/outputs`
+
+这是当前 `randomforest/` 目录下的主输出目录，默认对应“主规则增强策略”：
+
+- 数据通常来自 `data_augmentation/generated/augmented_dataset.csv`
+- 训练命令通常是 `pixi run rf-train`
+- 如果 `data_augmentation/generated/augmented_dataset.csv` 存在，`rf-train` 会优先读取它
+- 这里的结果代表：使用 `data_augmentation/augment_dataset.py` 那套规则增强后的随机森林输出
+
+也就是说，`randomforest/outputs` 不是“纯原始数据 baseline”，而是当前主增强方案下的随机森林结果。
+
+### 4.2 `randomforest/outputs_comparison`
+
+这是“直接复制样本对比组”的输出目录，对应：
+
+- 数据来自 `data_augmentation/comparison_direct_copy/generated/augmented_dataset.csv`
+- 训练命令是 `pixi run rf-train-comparison`
+- 这个对比组不会改年龄、体重、疼痛值
+- 它只会把原来在主增强流程里会被增强的父样本，按相同次数直接复制
+
+这个目录的作用是回答：
+
+- 如果保持训练集里的新增样本比例不变，但新增样本不做规则扰动，只是原样复制，随机森林会表现成什么样
+
+因此：
+
+- `outputs` = 主规则增强策略
+- `outputs_comparison` = 直接复制样本对比策略
+
+### 4.3 `randomforest_standard_rawdata`
+
+这是完全独立的原始数据 baseline 工程，不在本目录下，但和这里容易混淆：
+
+- 直接读取 `data_vectorized.csv`
+- 不依赖增强数据
+- 默认对原始有效样本做随机 `80/20` 切分
+- 它的结果目录在 `pain_prediction/randomforest_standard_rawdata/outputs`
+
+这个 baseline 的意义是：
+
+- 看“直接拿原始数据随机切分训练随机森林”时的结果
+
+它和 `randomforest/outputs` 不同，也和 `data_argmentation_A/original_only` 不同。
+
+### 4.4 `data_argmentation_A/outputs`
+
+这是另一套独立实验，不在 `randomforest/` 目录下，但它也是随机森林结果：
+
+- 它使用固定参考切分，不重新随机拆数据
+- 里面包含四组严格对照：
+  - `original_only`
+  - `high_pain_duplicate`
+  - `high_pain_local_jitter`
+  - `high_pain_local_resampling`
+- 每组结果在 `data_argmentation_A/outputs/<group_name>/`
+- 四组汇总表在 `data_argmentation_A/outputs/experiment_comparison.csv`
+
+这套实验的意义是：
+
+- 在同一批固定训练/测试样本上，严格比较不同“高痛增强机制”本身的效果
+
+### 4.5 怎么快速判断自己看到的是哪种结果
+
+可以按下面的规则快速判断：
+
+- 如果路径是 `randomforest/outputs/`，它通常是主规则增强策略的结果
+- 如果路径是 `randomforest/outputs_comparison/`，它是“直接复制样本”对比组结果
+- 如果路径是 `randomforest_standard_rawdata/outputs/`，它是原始数据随机 `80/20` baseline
+- 如果路径是 `data_argmentation_A/outputs/<group>/`，它是固定参考切分下的四组高痛增强对照实验
+## 5. 你最可能手动调整的地方
 
 1. 目标列：`config.py -> TARGET_COLUMN`
 - 比如从 `术后第一天_静息痛` 改为 `术后第二天_活动痛`。
@@ -131,7 +223,7 @@ pixi run python3 randomforest/train_random_forest_regression.py \
 6. 缺失值策略：`train_random_forest_regression.py`
 - 目前使用“每列中位数填补”，你可替换成更复杂策略。
 
-## 5. 输出结果怎么解读
+## 6. 输出结果怎么解读
 
 - `metrics.json`
   - `mae` 越小越好
@@ -152,7 +244,7 @@ pixi run python3 randomforest/train_random_forest_regression.py \
 - `outputs/plots/feature_importance_top20_mapping.csv`
   - 英文标签 `feature_en` 与原始特征名 `feature` 的映射表
 
-## 6. 常见报错
+## 7. 常见报错
 
 1. `目标列不存在`
 - 说明 `TARGET_COLUMN` 拼写与 CSV 表头不一致。

@@ -17,7 +17,8 @@ pain_prediction/randomforest/
     ├── metrics.json                  # 回归指标（MAE/RMSE/R2）
     ├── test_predictions.csv          # 测试集真实值与预测值
     ├── feature_importance.csv        # 特征重要性
-    └── inference_predictions.csv     # 全量数据推理结果（来自 predict.py）
+    ├── rf_search_results.csv         # 随机搜索每组参数的CV结果
+    ├── inference_predictions.csv     # 全量数据推理结果（来自 predict.py）
     └── plots/                        # 可视化图片输出目录
 ```
 
@@ -33,31 +34,79 @@ pixi install
 2. 修改配置（可选）
 
 编辑 `config.py`，重点看以下字段：
-- `DATA_PATH`：输入 CSV 路径
+- `DATA_PATH`：输入 CSV 路径（作为默认/兜底路径）
 - `TARGET_COLUMN`：你要预测的目标列（必须是数值）
 - `MANUAL_FEATURE_COLUMNS`：是否手动指定特征列
 - `RF_PARAMS`：随机森林超参数
 - `TEST_SIZE`、`RANDOM_STATE`：训练测试拆分参数
 
-3. 训练模型
+3. 用数据增强后的数据训练模型（推荐）
 
 ```bash
+cd pain_prediction
+pixi run augment-data
+pixi run python3 randomforest/train_random_forest_regression.py \
+  --data-path data_augmentation/generated/augmented_dataset.csv
+```
+
+如果你已经生成过 `data_augmentation/generated/augmented_dataset.csv`，也可以直接运行：
+
+```bash
+cd pain_prediction
 pixi run rf-train
 ```
+
+`rf-train` 会优先读取 `data_augmentation/generated/augmented_dataset.csv`；只有当这个文件不存在时，才会回退到 `randomforest/config.py` 里的 `DATA_PATH`。
 
 4. 使用模型推理
 
 ```bash
-pixi run rf-predict
+cd pain_prediction
+pixi run python3 randomforest/predict.py \
+  --data-path data_augmentation/generated/augmented_dataset.csv
 ```
 
 5. 可视化输出
 
 ```bash
+cd pain_prediction
 pixi run rf-plot
 ```
 
-## 3. 你最可能手动调整的地方
+## 3. 数据调用规则
+
+推荐把输入数据路径显式写在命令里，这样最不容易混淆：
+
+```bash
+cd pain_prediction
+pixi run python3 randomforest/train_random_forest_regression.py \
+  --data-path data_augmentation/generated/augmented_dataset.csv
+```
+
+如果你想改用原始向量化数据训练：
+
+```bash
+cd pain_prediction
+pixi run python3 randomforest/train_random_forest_regression.py \
+  --data-path data_vectorized.csv
+```
+
+当前训练脚本的数据读取优先级是：
+
+1. 命令行 `--data-path`
+2. `data_augmentation/generated/augmented_dataset.csv`（如果存在）
+3. `randomforest/config.py` 中的 `DATA_PATH`
+
+如果输入的是 `augmented_dataset.csv`，脚本会自动识别里面的 metadata 列：
+
+- `__meta_is_generated`
+- `__meta_dataset_split`
+
+这意味着训练时会自动把增强样本只放进训练池，并保留原始 held-out 样本作为固定测试集。
+
+`config.py` 里的 `TEST_SIZE` 只会在输入数据中没有显式测试集标记时才作为兜底拆分比例生效。
+
+## 4. 你最可能手动调整的地方
 
 1. 目标列：`config.py -> TARGET_COLUMN`
 - 比如从 `术后第一天_静息痛` 改为 `术后第二天_活动痛`。
@@ -82,7 +131,7 @@ pixi run rf-plot
 6. 缺失值策略：`train_random_forest_regression.py`
 - 目前使用“每列中位数填补”，你可替换成更复杂策略。
 
-## 4. 输出结果怎么解读
+## 5. 输出结果怎么解读
 
 - `metrics.json`
   - `mae` 越小越好
@@ -90,6 +139,8 @@ pixi run rf-plot
   - `r2` 越接近 1 越好（可为负，负值代表效果差于简单基线）
 - `feature_importance.csv`
   - 越靠前代表模型越依赖该特征（仅表示重要性，不代表因果关系）
+- `rf_search_results.csv`
+  - 记录每组随机搜索参数的交叉验证得分，可用于比较调参结果
 - `outputs/plots/true_vs_pred.png`
   - 真实值与预测值越贴近对角线，整体拟合通常越好
 - `outputs/plots/error_distribution.png`
@@ -101,7 +152,7 @@ pixi run rf-plot
 - `outputs/plots/feature_importance_top20_mapping.csv`
   - 英文标签 `feature_en` 与原始特征名 `feature` 的映射表
 
-## 5. 常见报错
+## 6. 常见报错
 
 1. `目标列不存在`
 - 说明 `TARGET_COLUMN` 拼写与 CSV 表头不一致。

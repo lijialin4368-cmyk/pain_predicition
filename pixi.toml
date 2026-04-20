@@ -8,6 +8,7 @@ version = "0.1.0"
 rf-train = "python3 randomforest/train_random_forest_regression.py"
 rf-predict = "python3 randomforest/predict.py"
 rf-plot = "MPLCONFIGDIR=/tmp/matplotlib python3 randomforest/visualize_outputs.py"
+augment-data = "python3 data_augmentation/augment_dataset.py"
 
 [dependencies]
 python = "3.10.*"

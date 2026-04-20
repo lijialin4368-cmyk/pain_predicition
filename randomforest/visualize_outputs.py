@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 import re
@@ -16,12 +17,7 @@ import pandas as pd
 
 
 BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / "outputs"
-PLOT_DIR = OUTPUT_DIR / "plots"
-
-METRICS_PATH = OUTPUT_DIR / "metrics.json"
-TEST_PRED_PATH = OUTPUT_DIR / "test_predictions.csv"
-FEATURE_IMPORTANCE_PATH = OUTPUT_DIR / "feature_importance.csv"
+DEFAULT_OUTPUT_DIR = BASE_DIR / "outputs"
 
 
 TOKEN_TRANSLATIONS = {
@@ -107,21 +103,35 @@ def translate_feature_name(name: str) -> str:
     return out.lower()
 
 
-def load_files() -> tuple[dict, pd.DataFrame, pd.DataFrame]:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Visualize random forest regression outputs.")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="Directory containing metrics.json, test_predictions.csv, and feature_importance.csv.",
+    )
+    return parser.parse_args()
+
+
+def load_files(output_dir: Path) -> tuple[dict, pd.DataFrame, pd.DataFrame]:
     """读取可视化所需文件。"""
-    for p in [METRICS_PATH, TEST_PRED_PATH, FEATURE_IMPORTANCE_PATH]:
+    metrics_path = output_dir / "metrics.json"
+    test_pred_path = output_dir / "test_predictions.csv"
+    feature_importance_path = output_dir / "feature_importance.csv"
+    for p in [metrics_path, test_pred_path, feature_importance_path]:
         if not p.exists():
             raise FileNotFoundError(f"缺少文件: {p}，请先执行训练。")
 
-    with METRICS_PATH.open("r", encoding="utf-8") as f:
+    with metrics_path.open("r", encoding="utf-8") as f:
         metrics = json.load(f)
 
-    pred_df = pd.read_csv(TEST_PRED_PATH, encoding="utf-8-sig")
-    fi_df = pd.read_csv(FEATURE_IMPORTANCE_PATH, encoding="utf-8-sig")
+    pred_df = pd.read_csv(test_pred_path, encoding="utf-8-sig")
+    fi_df = pd.read_csv(feature_importance_path, encoding="utf-8-sig")
     return metrics, pred_df, fi_df
 
 
-def plot_true_vs_pred(pred_df: pd.DataFrame, metrics: dict) -> Path:
+def plot_true_vs_pred(pred_df: pd.DataFrame, metrics: dict, plot_dir: Path) -> Path:
     """图1：真实值 vs 预测值散点图。"""
     fig, ax = plt.subplots(figsize=(7.2, 6.2))
     ax.scatter(pred_df["y_true"], pred_df["y_pred"], s=20, alpha=0.65)
@@ -142,14 +152,14 @@ def plot_true_vs_pred(pred_df: pd.DataFrame, metrics: dict) -> Path:
         va="top",
     )
 
-    out_path = PLOT_DIR / "true_vs_pred.png"
+    out_path = plot_dir / "true_vs_pred.png"
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
     return out_path
 
 
-def plot_error_distribution(pred_df: pd.DataFrame) -> Path:
+def plot_error_distribution(pred_df: pd.DataFrame, plot_dir: Path) -> Path:
     """图2：误差分布（y_pred - y_true）。"""
     err = pred_df["y_pred"] - pred_df["y_true"]
     fig, ax = plt.subplots(figsize=(7.2, 4.8))
@@ -159,14 +169,14 @@ def plot_error_distribution(pred_df: pd.DataFrame) -> Path:
     ax.set_xlabel("Error (y_pred - y_true)")
     ax.set_ylabel("Count")
 
-    out_path = PLOT_DIR / "error_distribution.png"
+    out_path = plot_dir / "error_distribution.png"
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
     return out_path
 
 
-def plot_abs_error_by_true(pred_df: pd.DataFrame) -> Path:
+def plot_abs_error_by_true(pred_df: pd.DataFrame, plot_dir: Path) -> Path:
     """图3：不同真实值水平上的平均绝对误差。"""
     group = (
         pred_df.groupby("y_true", as_index=False)["abs_error"]
@@ -180,14 +190,14 @@ def plot_abs_error_by_true(pred_df: pd.DataFrame) -> Path:
     ax.set_xlabel("True value")
     ax.set_ylabel("Mean absolute error")
 
-    out_path = PLOT_DIR / "mae_by_true_value.png"
+    out_path = plot_dir / "mae_by_true_value.png"
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
     return out_path
 
 
-def plot_feature_importance(fi_df: pd.DataFrame, top_n: int = 20) -> tuple[Path, Path]:
+def plot_feature_importance(fi_df: pd.DataFrame, plot_dir: Path, top_n: int = 20) -> tuple[Path, Path]:
     """图4：Top-N 特征重要性条形图。"""
     top_df = fi_df.sort_values("importance", ascending=False).head(top_n)
     top_df = top_df.reset_index(drop=True)
@@ -199,12 +209,12 @@ def plot_feature_importance(fi_df: pd.DataFrame, top_n: int = 20) -> tuple[Path,
     ax.set_xlabel("Importance")
     ax.set_ylabel("Feature")
 
-    out_path = PLOT_DIR / "feature_importance_top20.png"
+    out_path = plot_dir / "feature_importance_top20.png"
     fig.tight_layout()
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
 
-    mapping_path = PLOT_DIR / "feature_importance_top20_mapping.csv"
+    mapping_path = plot_dir / "feature_importance_top20_mapping.csv"
     top_df[["feature_en", "feature", "importance"]].to_csv(
         mapping_path, index=False, encoding="utf-8-sig"
     )
@@ -212,14 +222,16 @@ def plot_feature_importance(fi_df: pd.DataFrame, top_n: int = 20) -> tuple[Path,
 
 
 def main() -> None:
-    PLOT_DIR.mkdir(parents=True, exist_ok=True)
-    metrics, pred_df, fi_df = load_files()
+    args = parse_args()
+    plot_dir = args.output_dir / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    metrics, pred_df, fi_df = load_files(args.output_dir)
 
-    fi_plot_path, fi_map_path = plot_feature_importance(fi_df, top_n=20)
+    fi_plot_path, fi_map_path = plot_feature_importance(fi_df, plot_dir, top_n=20)
     paths = [
-        plot_true_vs_pred(pred_df, metrics),
-        plot_error_distribution(pred_df),
-        plot_abs_error_by_true(pred_df),
+        plot_true_vs_pred(pred_df, metrics, plot_dir),
+        plot_error_distribution(pred_df, plot_dir),
+        plot_abs_error_by_true(pred_df, plot_dir),
         fi_plot_path,
         fi_map_path,
     ]

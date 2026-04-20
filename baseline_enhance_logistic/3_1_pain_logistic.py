@@ -26,6 +26,16 @@ DAY_SENSITIVITY_SCALE = {
     "术后第二天": 1.12,
     "术后第三天": 1.08,
 }
+LOW_PAIN_GUARD_TARGETS = {
+    "手术当天_活动痛": {
+        "min_specificity": 0.35,
+        "max_threshold_upshift": 0.35,
+    },
+    "术后第一天_活动痛": {
+        "min_specificity": 0.35,
+        "max_threshold_upshift": 0.30,
+    },
+}
 
 DAY_EN = {
     "手术当天": "SurgeryDay",
@@ -49,16 +59,21 @@ TOTAL_OUTPUT_FILES = {
     "training_acc_all_targets.png",
     "training_loss_all_targets.png",
 }
+META_PREFIX = "__meta_"
+META_IS_GENERATED_COL = "__meta_is_generated"
+META_SPLIT_COL = "__meta_dataset_split"
+META_SOURCE_ROW_ID_COL = "__meta_source_row_id"
+TEST_SPLIT_VALUE = "test"
 
 
 def parse_args():
     script_dir = Path(__file__).resolve().parent
-    baseline_dir = script_dir.parent
-    project_dir = baseline_dir.parent
+    project_dir = script_dir.parent
+    augmented_input = project_dir / "data_augmentation" / "generated" / "augmented_dataset.csv"
 
     default_input_candidates = [
+        augmented_input,
         project_dir / "data_vectorized.csv",
-        baseline_dir / "data_vectorized.csv",
         script_dir / "data_vectorized.csv",
     ]
     default_input = next((p for p in default_input_candidates if p.exists()), default_input_candidates[0])
@@ -117,7 +132,7 @@ def parse_args():
     parser.add_argument(
         "--aux-cls-weight",
         type=float,
-        default=1.0,
+        default=1.5,
         help="Weight for the auxiliary high-pain BCE loss during training.",
     )
     parser.add_argument("--test-size", type=float, default=0.2, help="Test set ratio.")
@@ -152,13 +167,13 @@ def parse_args():
     parser.add_argument(
         "--high-pain-oversample-factor",
         type=float,
-        default=2.5,
+        default=4.0,
         help="Oversampling factor for high-pain samples in train set.",
     )
     parser.add_argument(
         "--high-pain-loss-weight",
         type=float,
-        default=2.0,
+        default=3.0,
         help="Extra loss weight for high-pain samples in train set.",
     )
     parser.add_argument(
@@ -195,7 +210,7 @@ def parse_args():
     parser.add_argument(
         "--rare-positive-target-count",
         type=float,
-        default=48.0,
+        default=80.0,
         help="Heads with positive count below this target receive extra rare-positive sensitivity boost.",
     )
     parser.add_argument(
@@ -213,8 +228,15 @@ def parse_args():
     parser.add_argument(
         "--rare-positive-oversample-boost",
         type=float,
-        default=1.5,
+        default=2.0,
         help="Extra oversampling multiplier for samples positive on rare heads.",
+    )
+    parser.add_argument(
+        "--conservative-selection-scope",
+        type=str,
+        choices=["overall", "per_target"],
+        default="per_target",
+        help="For conservative_tune: optimize thresholds under an overall validation accuracy floor, or per-target independently.",
     )
     parser.add_argument(
         "--conservative-min-val-pos",
@@ -232,7 +254,25 @@ def parse_args():
         "--conservative-min-acc-gain",
         type=float,
         default=0.003,
-        help="For conservative_tune: minimum validation accuracy gain required to change threshold.",
+        help="Legacy conservative_tune knob retained for compatibility; recall-first selection now mainly follows --conservative-min-accuracy.",
+    )
+    parser.add_argument(
+        "--conservative-min-accuracy",
+        type=float,
+        default=0.60,
+        help="For conservative_tune with per_target scope: absolute minimum validation accuracy floor when trading accuracy for recall.",
+    )
+    parser.add_argument(
+        "--overall-min-accuracy",
+        type=float,
+        default=0.60,
+        help="For conservative_tune with overall scope: minimum overall validation accuracy floor across all pain heads.",
+    )
+    parser.add_argument(
+        "--conservative-accuracy-upshift",
+        type=float,
+        default=0.35,
+        help="For conservative_tune with per_target scope: maximum upward threshold shift explored to satisfy strict accuracy floor.",
     )
     parser.add_argument(
         "--conservative-max-recall-drop",
@@ -280,6 +320,81 @@ def read_csv_with_fallback(path: Path) -> pd.DataFrame:
     raise RuntimeError(f"Cannot read CSV: {path}")
 
 
+def rebalance_train_pool_for_augmented_data(
+    base_train_idx: np.ndarray,
+    source_row_ids: np.ndarray,
+    is_generated: np.ndarray,
+    random_state: int,
+):
+    base_train_idx = np.asarray(base_train_idx, dtype=int)
+    info = {
+        "sampling_applied": False,
+        "unaugmented_original_available": 0,
+        "augmented_original_available": 0,
+        "generated_available": 0,
+        "augmented_pool_available": 0,
+        "selected_unaugmented_original": 0,
+        "selected_augmented_original": 0,
+        "selected_generated": 0,
+        "selected_augmented_pool": 0,
+        "selected_total": int(len(base_train_idx)),
+        "reason": "metadata_unavailable",
+    }
+    if len(base_train_idx) == 0:
+        info["reason"] = "empty_train_pool"
+        return base_train_idx, info
+
+    train_source_ids = np.asarray(source_row_ids[base_train_idx], dtype=int)
+    train_is_generated = np.asarray(is_generated[base_train_idx], dtype=int) == 1
+    generated_parent_ids = np.unique(train_source_ids[train_is_generated])
+    if len(generated_parent_ids) == 0:
+        info["reason"] = "no_generated_samples"
+        return base_train_idx, info
+
+    original_mask = ~train_is_generated
+    augmented_original_mask = original_mask & np.isin(train_source_ids, generated_parent_ids)
+    unaugmented_original_mask = original_mask & ~augmented_original_mask
+    augmented_pool_mask = augmented_original_mask | train_is_generated
+
+    unaugmented_original_idx = base_train_idx[unaugmented_original_mask]
+    augmented_pool_idx = base_train_idx[augmented_pool_mask]
+
+    info.update(
+        {
+            "unaugmented_original_available": int(len(unaugmented_original_idx)),
+            "augmented_original_available": int(np.sum(augmented_original_mask)),
+            "generated_available": int(np.sum(train_is_generated)),
+            "augmented_pool_available": int(len(augmented_pool_idx)),
+            "reason": "ok",
+        }
+    )
+
+    if len(unaugmented_original_idx) == 0 or len(augmented_pool_idx) == 0:
+        info["reason"] = "one_side_empty"
+        return base_train_idx, info
+
+    rng = np.random.default_rng(random_state)
+    sample_n = min(len(unaugmented_original_idx), len(augmented_pool_idx))
+    sampled_pos = np.sort(rng.choice(len(augmented_pool_idx), size=sample_n, replace=False))
+    sampled_augmented_idx = augmented_pool_idx[sampled_pos]
+    sampled_augmented_generated = np.asarray(is_generated[sampled_augmented_idx], dtype=int) == 1
+
+    balanced_idx = np.concatenate([unaugmented_original_idx, sampled_augmented_idx]).astype(int)
+    balanced_idx = rng.permutation(balanced_idx)
+
+    info.update(
+        {
+            "sampling_applied": True,
+            "selected_unaugmented_original": int(len(unaugmented_original_idx)),
+            "selected_augmented_original": int(np.sum(~sampled_augmented_generated)),
+            "selected_generated": int(np.sum(sampled_augmented_generated)),
+            "selected_augmented_pool": int(sample_n),
+            "selected_total": int(len(balanced_idx)),
+        }
+    )
+    return balanced_idx.astype(int), info
+
+
 def get_outcome_columns(df: pd.DataFrame):
     cols = []
     for day in OUTCOME_DAYS:
@@ -288,6 +403,10 @@ def get_outcome_columns(df: pd.DataFrame):
             if col in df.columns:
                 cols.append(col)
     return cols
+
+
+def is_metadata_column(col: str):
+    return str(col).startswith(META_PREFIX)
 
 
 def get_outcome_day_index(col: str):
@@ -340,11 +459,11 @@ def select_feature_columns(df: pd.DataFrame, target_col: str, feature_mode: str)
 
     if feature_mode == "strict":
         if target_col in outcome_cols:
-            return [c for c in df.columns if c not in outcome_cols]
-        return [c for c in df.columns if c != target_col]
+            return [c for c in df.columns if c not in outcome_cols and not is_metadata_column(c)]
+        return [c for c in df.columns if c != target_col and not is_metadata_column(c)]
 
     if feature_mode == "all":
-        return [c for c in df.columns if c != target_col]
+        return [c for c in df.columns if c != target_col and not is_metadata_column(c)]
 
     if feature_mode not in ("temporal", "strong_signal_temporal"):
         raise ValueError(f"Unsupported feature_mode: {feature_mode}")
@@ -353,6 +472,8 @@ def select_feature_columns(df: pd.DataFrame, target_col: str, feature_mode: str)
     feature_cols = []
     for c in df.columns:
         if c == target_col:
+            continue
+        if is_metadata_column(c):
             continue
         if c not in outcome_cols:
             feature_cols.append(c)
@@ -375,21 +496,38 @@ def prepare_features(df: pd.DataFrame, feature_cols, feature_impute: str):
     return x
 
 
-def split_train_test_multitask(y_mat: np.ndarray, test_size: float, random_state: int, max_tries: int = 128):
+def split_train_test_multitask(
+    y_mat: np.ndarray,
+    test_size: float,
+    random_state: int,
+    test_candidate_mask: np.ndarray | None = None,
+    max_tries: int = 128,
+):
     n = y_mat.shape[0]
     if not (0.0 < test_size < 1.0):
         raise ValueError(f"test_size must be between 0 and 1, got {test_size}")
     if n < 2:
         raise ValueError("Need at least 2 samples for split.")
 
-    n_test = max(1, int(round(n * test_size)))
-    n_test = min(n_test, n - 1)
+    if test_candidate_mask is None:
+        test_pool_idx = np.arange(n, dtype=int)
+        fixed_train_idx = np.array([], dtype=int)
+    else:
+        test_candidate_mask = np.asarray(test_candidate_mask, dtype=bool)
+        test_pool_idx = np.flatnonzero(test_candidate_mask)
+        fixed_train_idx = np.flatnonzero(~test_candidate_mask)
+        if len(test_pool_idx) < 2:
+            raise ValueError("Need at least 2 original samples to build an original-only test split.")
+
+    n_test = max(1, int(round(len(test_pool_idx) * test_size)))
+    n_test = min(n_test, len(test_pool_idx) - 1)
     rng = np.random.default_rng(random_state)
 
     for _ in range(max_tries):
-        perm = rng.permutation(n)
+        perm = rng.permutation(test_pool_idx)
         test_idx = perm[:n_test]
-        train_idx = perm[n_test:]
+        candidate_train_idx = perm[n_test:]
+        train_idx = np.concatenate([candidate_train_idx, fixed_train_idx]).astype(int)
 
         ok = True
         for h in range(y_mat.shape[1]):
@@ -409,7 +547,13 @@ def split_train_test_multitask(y_mat: np.ndarray, test_size: float, random_state
     raise ValueError("Could not create a valid train/test split for multi-head labels.")
 
 
-def split_train_val_multitask(y_train_mat: np.ndarray, val_size: float, random_state: int, max_tries: int = 128):
+def split_train_val_multitask(
+    y_train_mat: np.ndarray,
+    val_size: float,
+    random_state: int,
+    val_candidate_mask: np.ndarray | None = None,
+    max_tries: int = 128,
+):
     n = y_train_mat.shape[0]
     if not (0.0 <= val_size < 1.0):
         raise ValueError(f"val_size must be in [0,1), got {val_size}")
@@ -417,14 +561,26 @@ def split_train_val_multitask(y_train_mat: np.ndarray, val_size: float, random_s
         idx = np.arange(n, dtype=int)
         return idx, np.array([], dtype=int)
 
-    n_val = max(1, int(round(n * val_size)))
-    n_val = min(n_val, n - 1)
+    if val_candidate_mask is None:
+        val_pool_idx = np.arange(n, dtype=int)
+        fixed_train_idx = np.array([], dtype=int)
+    else:
+        val_candidate_mask = np.asarray(val_candidate_mask, dtype=bool)
+        val_pool_idx = np.flatnonzero(val_candidate_mask)
+        fixed_train_idx = np.flatnonzero(~val_candidate_mask)
+        if len(val_pool_idx) < 2:
+            idx = np.arange(n, dtype=int)
+            return idx, np.array([], dtype=int)
+
+    n_val = max(1, int(round(len(val_pool_idx) * val_size)))
+    n_val = min(n_val, len(val_pool_idx) - 1)
     rng = np.random.default_rng(random_state)
 
     for _ in range(max_tries):
-        perm = rng.permutation(n)
+        perm = rng.permutation(val_pool_idx)
         val_idx = perm[:n_val]
-        tr_idx = perm[n_val:]
+        candidate_train_idx = perm[n_val:]
+        tr_idx = np.concatenate([candidate_train_idx, fixed_train_idx]).astype(int)
 
         ok = True
         for h in range(y_train_mat.shape[1]):
@@ -643,6 +799,119 @@ def get_day_sensitivity_scale(target_col: str):
     return float(DAY_SENSITIVITY_SCALE.get(day, 1.0))
 
 
+def get_low_pain_guard(target_col: str):
+    guard = LOW_PAIN_GUARD_TARGETS.get(str(target_col))
+    if guard is None:
+        return None
+    return {
+        "min_specificity": float(guard.get("min_specificity", 0.0)),
+        "max_threshold_upshift": float(guard.get("max_threshold_upshift", 0.0)),
+    }
+
+
+def get_reference_threshold_for_target(args, target_col: str):
+    if args.threshold_strategy in ("day_relaxed", "conservative_tune"):
+        return get_day_relaxed_threshold(target_col, args.day_threshold_map, args.decision_threshold)
+    return float(args.decision_threshold)
+
+
+def summarize_multitask_threshold_metrics(args, target_cols, y_score_mat: np.ndarray, prob_mat: np.ndarray, threshold_map: dict):
+    head_metrics = {}
+    total_tp = 0
+    total_tn = 0
+    total_fp = 0
+    total_fn = 0
+    macro_acc = []
+    macro_precision = []
+    macro_recall = []
+    macro_f1 = []
+
+    for h, target_col in enumerate(target_cols):
+        if h >= y_score_mat.shape[1] or h >= prob_mat.shape[1]:
+            continue
+        score_vec = y_score_mat[:, h]
+        mask = ~np.isnan(score_vec)
+        if not np.any(mask):
+            continue
+
+        y_true = make_binary_target_from_score(score_vec[mask].astype(float), args.pain_threshold)
+        y_prob = prob_mat[mask, h].astype(float)
+        threshold = float(threshold_map.get(target_col, args.decision_threshold))
+        metrics = classification_metrics(y_true, y_prob, threshold=threshold)
+        head_metrics[target_col] = metrics
+
+        total_tp += int(metrics["tp"])
+        total_tn += int(metrics["tn"])
+        total_fp += int(metrics["fp"])
+        total_fn += int(metrics["fn"])
+        macro_acc.append(float(metrics["accuracy"]))
+        macro_precision.append(float(metrics["precision"]))
+        macro_f1.append(float(metrics["f1"]))
+        if int(np.sum(y_true == 1)) > 0:
+            macro_recall.append(float(metrics["recall"]))
+
+    total = total_tp + total_tn + total_fp + total_fn
+    overall_accuracy = (total_tp + total_tn) / total if total > 0 else 0.0
+    overall_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    overall_recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    overall_specificity = total_tn / (total_tn + total_fp) if (total_tn + total_fp) > 0 else 0.0
+    overall_fpr = total_fp / (total_fp + total_tn) if (total_fp + total_tn) > 0 else 0.0
+    overall_f1 = (
+        2.0 * overall_precision * overall_recall / (overall_precision + overall_recall)
+        if (overall_precision + overall_recall) > 0.0
+        else 0.0
+    )
+
+    return {
+        "threshold_map": {str(k): float(v) for k, v in threshold_map.items()},
+        "head_metrics": head_metrics,
+        "overall_accuracy": float(overall_accuracy),
+        "overall_precision": float(overall_precision),
+        "overall_recall": float(overall_recall),
+        "overall_specificity": float(overall_specificity),
+        "overall_fpr": float(overall_fpr),
+        "overall_f1": float(overall_f1),
+        "macro_accuracy": float(np.mean(macro_acc)) if len(macro_acc) > 0 else 0.0,
+        "macro_precision": float(np.mean(macro_precision)) if len(macro_precision) > 0 else 0.0,
+        "macro_recall": float(np.mean(macro_recall)) if len(macro_recall) > 0 else 0.0,
+        "macro_f1": float(np.mean(macro_f1)) if len(macro_f1) > 0 else 0.0,
+        "n_heads_evaluated": int(len(head_metrics)),
+        "n_positive_heads": int(len(macro_recall)),
+        "tp": int(total_tp),
+        "tn": int(total_tn),
+        "fp": int(total_fp),
+        "fn": int(total_fn),
+        "n_labels": int(total),
+    }
+
+
+def rank_multitask_selection(summary: dict, min_accuracy: float):
+    summary = summary or {}
+    accuracy = float(summary.get("overall_accuracy", 0.0))
+    ok = 1 if accuracy >= float(min_accuracy) else 0
+    if ok:
+        return (
+            ok,
+            float(summary.get("macro_recall", 0.0)),
+            float(summary.get("overall_recall", 0.0)),
+            float(summary.get("macro_f1", 0.0)),
+            float(summary.get("overall_f1", 0.0)),
+            accuracy,
+            -float(summary.get("overall_fpr", 0.0)),
+            float(summary.get("macro_precision", 0.0)),
+        )
+    return (
+        ok,
+        accuracy,
+        float(summary.get("macro_recall", 0.0)),
+        float(summary.get("overall_recall", 0.0)),
+        float(summary.get("macro_f1", 0.0)),
+        float(summary.get("overall_f1", 0.0)),
+        -float(summary.get("overall_fpr", 0.0)),
+        float(summary.get("macro_precision", 0.0)),
+    )
+
+
 def choose_threshold_by_validation(args, y_val: np.ndarray, prob_val: np.ndarray):
     base = classification_metrics(y_val, prob_val, threshold=args.decision_threshold)
 
@@ -686,67 +955,266 @@ def choose_threshold_conservative(args, target_col: str, y_val: np.ndarray, prob
     day_scale = get_day_sensitivity_scale(target_col)
     base = classification_metrics(y_val, prob_val, threshold=base_threshold)
     pos_count = int(np.sum(y_val == 1))
-    if pos_count < int(args.conservative_min_val_pos):
-        low_shift = max(0.0, float(args.conservative_low_val_pos_shift)) * day_scale
-        fpr_cap = min(1.0, base["fpr"] + max(0.0, float(args.conservative_low_val_pos_max_fpr_rise)) * day_scale)
-        candidates = np.linspace(max(0.05, float(base_threshold) - low_shift), float(base_threshold), args.threshold_grid_size)
-        candidates = np.unique(np.concatenate([candidates, np.array([float(base_threshold)])]))
-        feasible = []
-        for t in candidates:
-            m = classification_metrics(y_val, prob_val, threshold=float(t))
-            if m["fpr"] <= fpr_cap:
-                feasible.append((float(t), m))
+    min_accuracy = min(1.0, max(0.0, float(args.conservative_min_accuracy)))
+    low_pain_guard = get_low_pain_guard(target_col)
 
-        if len(feasible) > 0:
-            feasible.sort(
-                key=lambda x: (
-                    x[1]["recall"],
-                    x[1]["f1"],
-                    x[1]["precision"],
-                    x[1]["accuracy"],
-                    -x[1]["fpr"],
-                ),
-                reverse=True,
-            )
-            best_t, best_m = feasible[0]
-            if best_m["recall"] > base["recall"] + 1e-12:
-                return best_t, best_m, base, "conservative_low_val_pos_recall_boost"
-        return float(base_threshold), base, base, "conservative_low_val_pos_keep_day_relaxed"
+    low_shift = (
+        max(0.0, float(args.conservative_low_val_pos_shift)) * day_scale
+        if pos_count < int(args.conservative_min_val_pos)
+        else max(0.0, float(args.conservative_max_shift)) * day_scale
+    )
+    up_shift = max(0.0, float(args.conservative_accuracy_upshift))
+    if low_pain_guard is not None:
+        up_shift = max(up_shift, float(low_pain_guard["max_threshold_upshift"]))
 
-    candidates = np.linspace(0.05, 0.95, args.threshold_grid_size)
+    candidates = np.linspace(
+        max(0.05, float(base_threshold) - low_shift),
+        min(0.95, float(base_threshold) + up_shift),
+        args.threshold_grid_size,
+    )
     candidates = np.unique(np.concatenate([candidates, np.array([float(base_threshold)])]))
-    max_shift = max(0.0, float(args.conservative_max_shift)) * day_scale
-    candidates = np.array([
-        t for t in candidates if abs(float(t) - float(base_threshold)) <= max_shift + 1e-12
-    ])
-    if len(candidates) == 0:
-        candidates = np.array([float(base_threshold)])
 
     feasible = []
-    recall_floor = max(0.0, base["recall"] - float(args.conservative_max_recall_drop) * day_scale)
-    f1_floor = base["f1"] + float(args.conservative_min_f1_delta)
-    acc_floor = base["accuracy"] + float(args.conservative_min_acc_gain) / max(day_scale, 1e-6)
-
+    guarded_feasible = []
+    all_candidates = []
     for t in candidates:
         m = classification_metrics(y_val, prob_val, threshold=float(t))
-        if m["accuracy"] >= acc_floor and m["recall"] >= recall_floor and m["f1"] >= f1_floor:
+        all_candidates.append((float(t), m))
+        if m["accuracy"] >= min_accuracy - 1e-12:
             feasible.append((float(t), m))
+            if low_pain_guard is None or m["specificity"] >= float(low_pain_guard["min_specificity"]) - 1e-12:
+                guarded_feasible.append((float(t), m))
 
-    if len(feasible) == 0:
-        return float(base_threshold), base, base, "conservative_keep_day_relaxed"
+    selection_pool = guarded_feasible if len(guarded_feasible) > 0 else feasible
+    if len(selection_pool) > 0:
+        selection_pool.sort(
+            key=lambda x: (
+                x[1]["recall"],
+                x[1]["f1"],
+                x[1]["specificity"],
+                x[1]["accuracy"],
+                x[1]["precision"],
+                -abs(float(x[0]) - float(base_threshold)),
+            ),
+            reverse=True,
+        )
+        best_t, best_m = selection_pool[0]
+        if low_pain_guard is not None and len(guarded_feasible) > 0:
+            return best_t, best_m, base, "conservative_strict_acc_low_pain_guard"
+        if pos_count < int(args.conservative_min_val_pos):
+            return best_t, best_m, base, "conservative_strict_acc_low_val_pos"
+        return best_t, best_m, base, "conservative_strict_acc"
 
-    feasible.sort(
+    all_candidates.sort(
         key=lambda x: (
             x[1]["accuracy"],
+            x[1]["specificity"],
+            x[1]["recall"],
             x[1]["f1"],
-            x[1]["precision"],
             -abs(float(x[0]) - float(base_threshold)),
-            -x[1]["fpr"],
         ),
         reverse=True,
     )
-    best_t, best_m = feasible[0]
-    return best_t, best_m, base, "conservative_small_shift"
+    best_t, best_m = all_candidates[0]
+    if low_pain_guard is not None:
+        return best_t, best_m, base, "conservative_floor_unmet_low_pain_best_accuracy"
+    return best_t, best_m, base, "conservative_floor_unmet_best_accuracy"
+
+
+def choose_thresholds_conservative_overall(args, target_cols, y_val_score_mat: np.ndarray, prob_val_mat: np.ndarray):
+    base_threshold_map = {target_col: get_reference_threshold_for_target(args, target_col) for target_col in target_cols}
+    threshold_map = dict(base_threshold_map)
+    threshold_floor_map = dict(base_threshold_map)
+    candidate_map = {}
+    mode_map = {}
+
+    for h, target_col in enumerate(target_cols):
+        if h >= y_val_score_mat.shape[1] or h >= prob_val_mat.shape[1]:
+            mode_map[target_col] = "conservative_overall_keep_day_relaxed"
+            candidate_map[target_col] = []
+            continue
+
+        score_vec = y_val_score_mat[:, h]
+        mask = ~np.isnan(score_vec)
+        if not np.any(mask):
+            mode_map[target_col] = "conservative_overall_no_val"
+            candidate_map[target_col] = []
+            continue
+
+        y_val_vec = make_binary_target_from_score(score_vec[mask].astype(float), args.pain_threshold)
+        prob_val_vec = prob_val_mat[mask, h].astype(float)
+        base_threshold = float(base_threshold_map[target_col])
+        base_metrics = classification_metrics(y_val_vec, prob_val_vec, threshold=base_threshold)
+        day_scale = get_day_sensitivity_scale(target_col)
+        pos_count = int(np.sum(y_val_vec == 1))
+        candidate_thresholds = [base_threshold]
+        low_pain_guard = get_low_pain_guard(target_col)
+
+        if low_pain_guard is not None:
+            up_shift = max(0.0, float(low_pain_guard["max_threshold_upshift"]))
+            candidate_thresholds = np.linspace(
+                base_threshold,
+                min(0.95, base_threshold + up_shift),
+                args.threshold_grid_size,
+            ).tolist()
+            filtered = []
+            for t in candidate_thresholds:
+                m = classification_metrics(y_val_vec, prob_val_vec, threshold=float(t))
+                filtered.append((float(t), m))
+
+            feasible = [item for item in filtered if float(item[1]["specificity"]) >= float(low_pain_guard["min_specificity"]) - 1e-12]
+            if len(feasible) > 0:
+                feasible.sort(
+                    key=lambda x: (
+                        x[1]["recall"],
+                        x[1]["f1"],
+                        x[1]["accuracy"],
+                        x[1]["specificity"],
+                        -abs(float(x[0]) - float(base_threshold)),
+                    ),
+                    reverse=True,
+                )
+                guarded_threshold, guarded_metrics = feasible[0]
+                mode_map[target_col] = "conservative_overall_low_pain_guard"
+            else:
+                filtered.sort(
+                    key=lambda x: (
+                        x[1]["specificity"],
+                        x[1]["accuracy"],
+                        x[1]["recall"],
+                        x[1]["f1"],
+                        -abs(float(x[0]) - float(base_threshold)),
+                    ),
+                    reverse=True,
+                )
+                guarded_threshold, guarded_metrics = filtered[0]
+                mode_map[target_col] = "conservative_overall_low_pain_guard_best_effort"
+
+            threshold_map[target_col] = float(guarded_threshold)
+            threshold_floor_map[target_col] = float(guarded_threshold)
+            filtered.append((base_threshold, base_metrics))
+            filtered.append((guarded_threshold, guarded_metrics))
+            dedup = {}
+            for t, m in filtered:
+                dedup[round(float(t), 10)] = (float(t), m)
+            candidate_map[target_col] = sorted(dedup.values(), key=lambda x: x[0], reverse=True)
+            continue
+
+        if pos_count < int(args.conservative_min_val_pos):
+            low_shift = max(0.0, float(args.conservative_low_val_pos_shift)) * day_scale
+            candidate_thresholds = np.linspace(
+                max(0.05, base_threshold - low_shift),
+                base_threshold,
+                args.threshold_grid_size,
+            ).tolist()
+            fpr_cap = min(1.0, base_metrics["fpr"] + max(0.0, float(args.conservative_low_val_pos_max_fpr_rise)) * day_scale)
+            filtered = []
+            for t in candidate_thresholds:
+                m = classification_metrics(y_val_vec, prob_val_vec, threshold=float(t))
+                if m["fpr"] <= fpr_cap + 1e-12:
+                    filtered.append((float(t), m))
+            mode_map[target_col] = "conservative_overall_low_val_pos"
+        else:
+            max_shift = max(0.0, float(args.conservative_max_shift)) * day_scale
+            candidate_thresholds = np.linspace(
+                max(0.05, base_threshold - max_shift),
+                base_threshold,
+                args.threshold_grid_size,
+            ).tolist()
+            f1_floor = max(0.0, base_metrics["f1"] + float(args.conservative_min_f1_delta))
+            filtered = []
+            for t in candidate_thresholds:
+                m = classification_metrics(y_val_vec, prob_val_vec, threshold=float(t))
+                if m["f1"] >= f1_floor - 1e-12:
+                    filtered.append((float(t), m))
+            mode_map[target_col] = "conservative_overall"
+
+        filtered.append((base_threshold, base_metrics))
+        dedup = {}
+        for t, m in filtered:
+            dedup[round(float(t), 10)] = (float(t), m)
+        candidate_map[target_col] = sorted(dedup.values(), key=lambda x: x[0], reverse=True)
+
+    current_summary = summarize_multitask_threshold_metrics(args, target_cols, y_val_score_mat, prob_val_mat, threshold_map)
+    base_summary = current_summary
+    current_rank = rank_multitask_selection(current_summary, float(args.overall_min_accuracy))
+    floor_met = float(base_summary["overall_accuracy"]) >= float(args.overall_min_accuracy)
+
+    while True:
+        best_move = None
+        best_move_rank = None
+
+        for target_col in target_cols:
+            current_threshold = float(threshold_map.get(target_col, base_threshold_map[target_col]))
+            current_head_metrics = current_summary["head_metrics"].get(target_col)
+            current_head_recall = float(current_head_metrics["recall"]) if current_head_metrics is not None else 0.0
+
+            for candidate_threshold, candidate_metrics in candidate_map.get(target_col, []):
+                if candidate_threshold >= current_threshold - 1e-12:
+                    continue
+                if candidate_threshold < float(threshold_floor_map.get(target_col, base_threshold_map[target_col])) - 1e-12:
+                    continue
+                if float(candidate_metrics["recall"]) <= current_head_recall + 1e-12:
+                    continue
+
+                tentative_threshold_map = dict(threshold_map)
+                tentative_threshold_map[target_col] = float(candidate_threshold)
+                tentative_summary = summarize_multitask_threshold_metrics(
+                    args,
+                    target_cols,
+                    y_val_score_mat,
+                    prob_val_mat,
+                    tentative_threshold_map,
+                )
+                tentative_rank = rank_multitask_selection(tentative_summary, float(args.overall_min_accuracy))
+                if float(tentative_summary["overall_accuracy"]) < float(args.overall_min_accuracy):
+                    continue
+                if tentative_rank <= current_rank:
+                    continue
+                if float(tentative_summary["macro_recall"]) <= float(current_summary["macro_recall"]) + 1e-12 and float(
+                    tentative_summary["overall_recall"]
+                ) <= float(current_summary["overall_recall"]) + 1e-12:
+                    continue
+
+                move_key = (
+                    tentative_rank,
+                    float(candidate_metrics["recall"]),
+                    float(candidate_metrics["f1"]),
+                    -abs(float(candidate_threshold) - float(base_threshold_map[target_col])),
+                )
+                if best_move is None or move_key > best_move_rank:
+                    best_move = (target_col, float(candidate_threshold), tentative_summary)
+                    best_move_rank = move_key
+
+        if best_move is None:
+            break
+
+        target_col, candidate_threshold, tentative_summary = best_move
+        threshold_map[target_col] = candidate_threshold
+        current_summary = tentative_summary
+        current_rank = rank_multitask_selection(current_summary, float(args.overall_min_accuracy))
+        mode_map[target_col] = "conservative_overall_recall_priority"
+
+    selected_head_metrics = current_summary["head_metrics"]
+    base_head_metrics = base_summary["head_metrics"]
+    for target_col in target_cols:
+        if target_col not in current_summary["head_metrics"]:
+            mode_map[target_col] = "conservative_overall_no_val"
+        elif target_col in LOW_PAIN_GUARD_TARGETS:
+            current_threshold = float(threshold_map.get(target_col, base_threshold_map[target_col]))
+            guarded_threshold = float(threshold_floor_map.get(target_col, base_threshold_map[target_col]))
+            if current_threshold <= guarded_threshold + 1e-12:
+                mode_map.setdefault(target_col, "conservative_overall_low_pain_guard")
+            else:
+                mode_map.setdefault(target_col, "conservative_overall_low_pain_guard_relaxed")
+        elif float(threshold_map.get(target_col, base_threshold_map[target_col])) < float(base_threshold_map[target_col]) - 1e-12:
+            mode_map[target_col] = "conservative_overall_recall_priority"
+        elif not floor_met:
+            mode_map[target_col] = "conservative_overall_floor_unmet_keep_day_relaxed"
+        else:
+            mode_map[target_col] = "conservative_overall_keep_day_relaxed"
+
+    return threshold_map, selected_head_metrics, base_head_metrics, current_summary, base_summary, mode_map
 
 
 def row_normalize_cm(cm: np.ndarray):
@@ -931,6 +1399,8 @@ def save_combined_confusion_csv(results, out_file: Path):
 def fit_shared_backbone_score_multitask(
     x_train: np.ndarray,
     y_train_score_mat: np.ndarray,
+    x_val: np.ndarray | None,
+    y_val_score_mat: np.ndarray | None,
     target_cols,
     args,
 ):
@@ -989,9 +1459,18 @@ def fit_shared_backbone_score_multitask(
 
     best_loss = np.inf
     best_params = tuple(p.copy() for p in params)
+    best_selection_summary = None
+    best_selection_rank = None
     stale = 0
     history = []
     batch_size = max(1, min(int(args.batch_size), n_samples))
+    has_val = (
+        x_val is not None
+        and y_val_score_mat is not None
+        and len(x_val) > 0
+        and np.size(y_val_score_mat) > 0
+    )
+    checkpoint_threshold_map = {target_col: get_reference_threshold_for_target(args, target_col) for target_col in target_cols}
 
     for epoch in range(1, int(args.epochs) + 1):
         if not args.disable_high_pain_oversampling:
@@ -1076,6 +1555,17 @@ def fit_shared_backbone_score_multitask(
         head_acc = np.divide(head_correct, np.maximum(1.0, head_total))
         abs_err = np.abs(score_all - y_filled) * label_mask.astype(float)
         head_mae = np.divide(np.sum(abs_err, axis=0), np.maximum(1.0, head_total))
+        val_summary = None
+        if has_val:
+            val_score_all, _, _ = forward_multi_head_scores(x_val, params)
+            val_prob_all = score_to_probability(val_score_all, args.pain_threshold, args.prob_temperature)
+            val_summary = summarize_multitask_threshold_metrics(
+                args,
+                target_cols,
+                y_val_score_mat,
+                val_prob_all,
+                checkpoint_threshold_map,
+            )
         history.append(
             {
                 "epoch": int(epoch),
@@ -1085,22 +1575,49 @@ def fit_shared_backbone_score_multitask(
                 "train_acc": float(train_acc),
                 "head_train_acc": head_acc.tolist(),
                 "head_train_mae": head_mae.tolist(),
+                "val_overall_accuracy": float(val_summary["overall_accuracy"]) if val_summary is not None else float("nan"),
+                "val_macro_recall": float(val_summary["macro_recall"]) if val_summary is not None else float("nan"),
+                "val_overall_recall": float(val_summary["overall_recall"]) if val_summary is not None else float("nan"),
             }
         )
 
         if args.verbose and (epoch == 1 or epoch % 100 == 0 or epoch == int(args.epochs)):
-            print(f"[epoch {epoch:4d}] train_loss={train_loss:.6f} train_acc={train_acc:.4f}")
+            if val_summary is None:
+                print(f"[epoch {epoch:4d}] train_loss={train_loss:.6f} train_acc={train_acc:.4f}")
+            else:
+                print(
+                    f"[epoch {epoch:4d}] train_loss={train_loss:.6f} train_acc={train_acc:.4f} "
+                    f"val_acc={val_summary['overall_accuracy']:.4f} "
+                    f"val_macro_rec={val_summary['macro_recall']:.4f}"
+                )
 
-        if best_loss - train_loss > 1e-8:
-            best_loss = train_loss
-            best_params = tuple(p.copy() for p in params)
+        improved = False
+        if val_summary is not None:
+            candidate_rank = rank_multitask_selection(val_summary, float(args.overall_min_accuracy))
+            if (
+                best_selection_rank is None
+                or candidate_rank > best_selection_rank
+                or (candidate_rank == best_selection_rank and best_loss - train_loss > 1e-8)
+            ):
+                best_selection_rank = candidate_rank
+                best_selection_summary = val_summary
+                best_loss = train_loss
+                best_params = tuple(p.copy() for p in params)
+                improved = True
+        else:
+            if best_loss - train_loss > 1e-8:
+                best_loss = train_loss
+                best_params = tuple(p.copy() for p in params)
+                improved = True
+
+        if improved:
             stale = 0
         else:
             stale += 1
             if stale >= int(args.patience):
                 break
 
-    return best_params, best_loss, history, (not args.disable_high_pain_oversampling)
+    return best_params, best_loss, history, (not args.disable_high_pain_oversampling), best_selection_summary
 
 
 def run_shared_backbone_targets(args, df: pd.DataFrame, targets):
@@ -1127,18 +1644,57 @@ def run_shared_backbone_targets(args, df: pd.DataFrame, targets):
     any_label_mask = np.any(~np.isnan(y_score_mat), axis=1)
     if not np.any(any_label_mask):
         raise ValueError("All selected targets are missing for all rows.")
+    if META_IS_GENERATED_COL in df.columns:
+        is_generated = pd.to_numeric(df[META_IS_GENERATED_COL], errors="coerce").fillna(0).to_numpy(dtype=int)
+    else:
+        is_generated = np.zeros(len(df), dtype=int)
+    if META_SPLIT_COL in df.columns:
+        split_labels = df[META_SPLIT_COL].astype(str).to_numpy()
+    else:
+        split_labels = np.array([""] * len(df), dtype=object)
+    if META_SOURCE_ROW_ID_COL in df.columns:
+        source_row_ids = pd.to_numeric(df[META_SOURCE_ROW_ID_COL], errors="coerce").to_numpy(dtype=float)
+        fallback_row_ids = np.arange(len(df), dtype=float)
+        source_row_ids = np.where(np.isnan(source_row_ids), fallback_row_ids, source_row_ids).astype(int)
+    else:
+        source_row_ids = np.arange(len(df), dtype=int)
 
     x_df = prepare_features(df.loc[any_label_mask].copy(), shared_feature_cols, args.feature_impute)
     y_score_mat = y_score_mat[any_label_mask]
     y_bin_mat = y_bin_mat[any_label_mask]
+    is_generated = is_generated[any_label_mask]
+    split_labels = split_labels[any_label_mask]
+    source_row_ids = source_row_ids[any_label_mask]
+    explicit_test_mask = split_labels == TEST_SPLIT_VALUE
 
-    train_idx, test_idx = split_train_test_multitask(y_bin_mat, args.test_size, args.random_state)
+    if np.any(explicit_test_mask) and np.any(~explicit_test_mask):
+        test_idx = np.flatnonzero(explicit_test_mask).astype(int)
+        train_candidate_idx = np.flatnonzero(~explicit_test_mask).astype(int)
+    else:
+        original_mask = is_generated == 0
+        train_candidate_idx, test_idx = split_train_test_multitask(
+            y_bin_mat,
+            args.test_size,
+            args.random_state,
+            test_candidate_mask=original_mask,
+        )
+    train_idx, train_sampling_info = rebalance_train_pool_for_augmented_data(
+        train_candidate_idx,
+        source_row_ids,
+        is_generated,
+        args.random_state + 101,
+    )
     x_all = x_df.to_numpy(dtype=float)
     x_train_all, x_test = x_all[train_idx], x_all[test_idx]
     y_score_train_all, y_score_test = y_score_mat[train_idx], y_score_mat[test_idx]
     y_bin_train_all, y_bin_test = y_bin_mat[train_idx], y_bin_mat[test_idx]
+    is_generated_train_all = is_generated[train_idx]
 
-    tr_sub_idx, val_idx = split_train_val_multitask(y_bin_train_all, args.val_size, args.random_state + 17)
+    tr_sub_idx, val_idx = split_train_val_multitask(
+        y_bin_train_all,
+        args.val_size,
+        args.random_state + 17,
+    )
     x_train, y_score_train = x_train_all[tr_sub_idx], y_score_train_all[tr_sub_idx]
     x_val, y_score_val = x_train_all[val_idx], y_score_train_all[val_idx]
     y_bin_val = y_bin_train_all[val_idx]
@@ -1146,9 +1702,11 @@ def run_shared_backbone_targets(args, df: pd.DataFrame, targets):
     x_train_std, x_test_std = standardize_train_test(x_train, x_test)
     _, x_val_std = standardize_train_test(x_train, x_val)
 
-    best_params, train_loss, train_history, oversampling_used = fit_shared_backbone_score_multitask(
+    best_params, train_loss, train_history, oversampling_used, best_selection_summary = fit_shared_backbone_score_multitask(
         x_train=x_train_std,
         y_train_score_mat=y_score_train,
+        x_val=x_val_std,
+        y_val_score_mat=y_score_val,
         target_cols=targets,
         args=args,
     )
@@ -1161,6 +1719,24 @@ def run_shared_backbone_targets(args, df: pd.DataFrame, targets):
     val_prob_mat = score_to_probability(val_score_pred_mat, args.pain_threshold, args.prob_temperature)
 
     low_label, high_label = get_class_labels(args.pain_threshold)
+    overall_threshold_map = {}
+    overall_val_selected_metrics = {}
+    overall_val_base_metrics = {}
+    overall_val_summary_selected = None
+    overall_val_summary_base = None
+    overall_threshold_mode_map = {}
+    if (
+        args.threshold_strategy == "conservative_tune"
+        and args.conservative_selection_scope == "overall"
+        and len(val_idx) > 0
+    ):
+        overall_threshold_map, overall_val_selected_metrics, overall_val_base_metrics, overall_val_summary_selected, overall_val_summary_base, overall_threshold_mode_map = choose_thresholds_conservative_overall(
+            args,
+            targets,
+            y_score_val,
+            val_prob_mat,
+        )
+
     results = []
     for h, target_col in enumerate(targets):
         score_test_h = y_score_test[:, h]
@@ -1185,7 +1761,16 @@ def run_shared_backbone_targets(args, df: pd.DataFrame, targets):
             y_val_vec = np.array([])
             prob_val_vec = np.array([])
 
-        if args.threshold_strategy == "day_relaxed":
+        if (
+            args.threshold_strategy == "conservative_tune"
+            and args.conservative_selection_scope == "overall"
+            and len(val_idx) > 0
+        ):
+            chosen_threshold = float(overall_threshold_map.get(target_col, get_reference_threshold_for_target(args, target_col)))
+            val_base = overall_val_base_metrics.get(target_col)
+            val_selected = overall_val_selected_metrics.get(target_col)
+            threshold_selection_mode = overall_threshold_mode_map.get(target_col, "conservative_overall_keep_day_relaxed")
+        elif args.threshold_strategy == "day_relaxed":
             chosen_threshold = get_day_relaxed_threshold(target_col, args.day_threshold_map, args.decision_threshold)
             val_base = classification_metrics(y_val_vec, prob_val_vec, threshold=args.decision_threshold) if len(y_val_vec) > 0 else None
             val_selected = classification_metrics(y_val_vec, prob_val_vec, threshold=chosen_threshold) if len(y_val_vec) > 0 else None
@@ -1233,9 +1818,16 @@ def run_shared_backbone_targets(args, df: pd.DataFrame, targets):
                 "target_col": target_col,
                 "target_en": target_to_english_name(target_col),
                 "n_total_non_missing": int(np.sum(~np.isnan(y_score_mat[:, h]))),
-                "n_train": int(len(train_idx)),
+                "n_train": int(len(tr_sub_idx)),
+                "n_train_pool": int(len(train_idx)),
                 "n_test": int(len(test_idx)),
                 "n_val": int(np.sum(val_mask_h)) if len(val_idx) > 0 else 0,
+                "n_train_generated": int(np.sum(is_generated_train_all[tr_sub_idx] == 1)),
+                "n_train_original": int(np.sum(is_generated_train_all[tr_sub_idx] == 0)),
+                "n_val_generated": int(np.sum(is_generated_train_all[val_idx] == 1)) if len(val_idx) > 0 else 0,
+                "n_val_original": int(np.sum(is_generated_train_all[val_idx] == 0)) if len(val_idx) > 0 else 0,
+                "n_test_generated": int(np.sum(is_generated[test_idx] == 1)),
+                "n_test_original": int(np.sum(is_generated[test_idx] == 0)),
                 "n_pos_train": int(np.sum(make_binary_target_from_score(train_score_h[train_mask_h], args.pain_threshold))),
                 "n_pos_val": int(np.sum(y_val_vec)) if len(y_val_vec) > 0 else 0,
                 "n_pos_test": int(np.sum(y_test_vec)),
@@ -1244,6 +1836,12 @@ def run_shared_backbone_targets(args, df: pd.DataFrame, targets):
                 "train_loss": float(train_loss),
                 "train_reg_loss": float(task_train_history[-1]["train_reg_loss"]) if len(task_train_history) > 0 else float("nan"),
                 "train_aux_cls_loss": float(task_train_history[-1]["train_aux_cls_loss"]) if len(task_train_history) > 0 else float("nan"),
+                "checkpoint_val_overall_accuracy": float(best_selection_summary["overall_accuracy"]) if best_selection_summary is not None else float("nan"),
+                "checkpoint_val_macro_recall": float(best_selection_summary["macro_recall"]) if best_selection_summary is not None else float("nan"),
+                "overall_val_accuracy_base": float(overall_val_summary_base["overall_accuracy"]) if overall_val_summary_base is not None else float("nan"),
+                "overall_val_accuracy_selected": float(overall_val_summary_selected["overall_accuracy"]) if overall_val_summary_selected is not None else float("nan"),
+                "overall_val_macro_recall_base": float(overall_val_summary_base["macro_recall"]) if overall_val_summary_base is not None else float("nan"),
+                "overall_val_macro_recall_selected": float(overall_val_summary_selected["macro_recall"]) if overall_val_summary_selected is not None else float("nan"),
                 "chosen_threshold": float(chosen_threshold),
                 "threshold_selection_mode": threshold_selection_mode,
                 "val_metrics_base": val_base,
@@ -1259,6 +1857,16 @@ def run_shared_backbone_targets(args, df: pd.DataFrame, targets):
                 "train_history": task_train_history,
                 "shared_train_history": train_history,
                 "oversampling_used": bool(oversampling_used),
+                "train_sampling_applied": bool(train_sampling_info["sampling_applied"]),
+                "train_sampling_reason": train_sampling_info["reason"],
+                "train_unaugmented_original_available": int(train_sampling_info["unaugmented_original_available"]),
+                "train_augmented_original_available": int(train_sampling_info["augmented_original_available"]),
+                "train_generated_available": int(train_sampling_info["generated_available"]),
+                "train_augmented_pool_available": int(train_sampling_info["augmented_pool_available"]),
+                "train_unaugmented_original_selected": int(train_sampling_info["selected_unaugmented_original"]),
+                "train_augmented_original_selected": int(train_sampling_info["selected_augmented_original"]),
+                "train_generated_selected": int(train_sampling_info["selected_generated"]),
+                "train_augmented_pool_selected": int(train_sampling_info["selected_augmented_pool"]),
             }
         )
 
@@ -1276,12 +1884,35 @@ def print_result(result: dict):
     print("=" * 82)
     print(f"Samples (non-missing)    : {result['n_total_non_missing']}")
     print(f"Train / Val / Test       : {result['n_train']} / {result['n_val']} / {result['n_test']}")
+    print(f"Train pool before val    : {result['n_train_pool']}")
+    print(
+        "Origin split            : "
+        f"train O/G={result['n_train_original']}/{result['n_train_generated']}, "
+        f"val O/G={result['n_val_original']}/{result['n_val_generated']}, "
+        f"test O/G={result['n_test_original']}/{result['n_test_generated']}"
+    )
+    if result["train_sampling_applied"]:
+        print(
+            "Balanced train sampling : "
+            f"unaug all={result['train_unaugmented_original_available']}, "
+            f"aug pool avail={result['train_augmented_pool_available']}, "
+            f"selected aug={result['train_augmented_pool_selected']} "
+            f"(orig {result['train_augmented_original_selected']}, gen {result['train_generated_selected']})"
+        )
+    else:
+        print(f"Balanced train sampling : skipped ({result['train_sampling_reason']})")
     print(f"Pos in Train/Val/Test    : {result['n_pos_train']} / {result['n_pos_val']} / {result['n_pos_test']}")
     print(f"Class split              : {result['low_label']} vs {result['high_label']}")
     print(f"High pain in train (>3)  : {result['n_high_pain_train']}")
     print(f"Feature count            : {result['feature_count']}")
     print(f"Train loss               : {result['train_loss']:.6f}")
     print(f"Train reg / aux cls loss : {result['train_reg_loss']:.6f} / {result['train_aux_cls_loss']:.6f}")
+    if not np.isnan(result.get("checkpoint_val_overall_accuracy", float("nan"))):
+        print(
+            "Checkpoint objective     : "
+            f"val overall acc={result['checkpoint_val_overall_accuracy']:.3f}, "
+            f"val macro recall={result['checkpoint_val_macro_recall']:.3f}"
+        )
     print(f"Threshold                : {result['chosen_threshold']:.3f} ({result['threshold_selection_mode']})")
     if result["val_metrics_base"] is not None and result["val_metrics_selected"] is not None:
         vb = result["val_metrics_base"]
@@ -1293,6 +1924,12 @@ def print_result(result: dict):
             f"pre {vb['precision']:.3f}->{vs['precision']:.3f}, "
             f"rec {vb['recall']:.3f}->{vs['recall']:.3f}, "
             f"f1 {vb['f1']:.3f}->{vs['f1']:.3f}"
+        )
+    if not np.isnan(result.get("overall_val_accuracy_selected", float("nan"))):
+        print(
+            "Overall val @base->sel   : "
+            f"acc {result['overall_val_accuracy_base']:.3f}->{result['overall_val_accuracy_selected']:.3f}, "
+            f"macro_rec {result['overall_val_macro_recall_base']:.3f}->{result['overall_val_macro_recall_selected']:.3f}"
         )
     print("-" * 82)
     print(f"Regression MAE           : {r['mae']:.4f}")
@@ -1379,9 +2016,13 @@ def main():
     if args.threshold_strategy == "conservative_tune":
         print(
             "Conservative guards      : "
+            f"scope={args.conservative_selection_scope}, "
             f"min_val_pos={args.conservative_min_val_pos}, "
             f"max_shift={args.conservative_max_shift}, "
+            f"accuracy_upshift={args.conservative_accuracy_upshift}, "
             f"min_acc_gain={args.conservative_min_acc_gain}, "
+            f"min_accuracy={args.conservative_min_accuracy}, "
+            f"overall_min_accuracy={args.overall_min_accuracy}, "
             f"max_recall_drop={args.conservative_max_recall_drop}, "
             f"min_f1_delta={args.conservative_min_f1_delta}, "
             f"low_val_pos_shift={args.conservative_low_val_pos_shift}, "
@@ -1394,6 +2035,7 @@ def main():
         f"max_boost={args.rare_positive_max_boost}, "
         f"oversample_boost={args.rare_positive_oversample_boost}"
     )
+    print(f"Low-pain guard targets   : {LOW_PAIN_GUARD_TARGETS}")
     print(f"Day sensitivity scale    : {DAY_SENSITIVITY_SCALE}")
     print(f"Feature mode             : {args.feature_mode}")
     if args.feature_mode == "all":
@@ -1404,6 +2046,7 @@ def main():
     if missing_targets:
         print(f"Missing targets skipped  : {missing_targets}")
     print(f"Output dir               : {args.output_dir}")
+    print("Augmented train rule     : keep all never-augmented originals; sample equal-sized rows from augmented pool")
 
     all_rows = []
     all_results = run_shared_backbone_targets(args, df, targets)
@@ -1437,9 +2080,29 @@ def main():
                 "tp": m["tp"],
                 "n_total_non_missing": result["n_total_non_missing"],
                 "n_train": result["n_train"],
+                "n_train_pool": result["n_train_pool"],
                 "n_val": result["n_val"],
                 "n_test": result["n_test"],
+                "n_train_original": result["n_train_original"],
+                "n_train_generated": result["n_train_generated"],
+                "n_val_original": result["n_val_original"],
+                "n_val_generated": result["n_val_generated"],
+                "n_test_original": result["n_test_original"],
+                "n_test_generated": result["n_test_generated"],
+                "train_sampling_applied": result["train_sampling_applied"],
+                "train_unaugmented_original_available": result["train_unaugmented_original_available"],
+                "train_augmented_pool_available": result["train_augmented_pool_available"],
+                "train_augmented_pool_selected": result["train_augmented_pool_selected"],
+                "train_augmented_original_selected": result["train_augmented_original_selected"],
+                "train_generated_selected": result["train_generated_selected"],
+                "checkpoint_val_overall_accuracy": result["checkpoint_val_overall_accuracy"],
+                "checkpoint_val_macro_recall": result["checkpoint_val_macro_recall"],
+                "overall_val_accuracy_base": result["overall_val_accuracy_base"],
+                "overall_val_accuracy_selected": result["overall_val_accuracy_selected"],
+                "overall_val_macro_recall_base": result["overall_val_macro_recall_base"],
+                "overall_val_macro_recall_selected": result["overall_val_macro_recall_selected"],
                 "chosen_threshold": result["chosen_threshold"],
+                "threshold_selection_mode": result["threshold_selection_mode"],
                 "train_loss": result["train_loss"],
                 "train_reg_loss": result["train_reg_loss"],
                 "train_aux_cls_loss": result["train_aux_cls_loss"],

@@ -1,12 +1,13 @@
 """使用已训练好的随机森林回归模型做推理。
 
 运行方式（示例）：
-    cd pain_prediction/randomforest
-    python3 predict.py
+    cd pain_prediction
+    pixi run python3 randomforest/predict.py --data-path data_vectorized.csv
 """
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import joblib
@@ -22,6 +23,8 @@ from config import (
 )
 from temporal_feature_filter import apply_temporal_feature_filter
 
+META_PREFIX = "__meta_"
+
 
 # 这里默认读取训练时保存的模型。
 MODEL_PATH = ARTIFACT_DIR / "rf_regressor.joblib"
@@ -30,12 +33,36 @@ MODEL_PATH = ARTIFACT_DIR / "rf_regressor.joblib"
 PREDICT_OUTPUT_PATH = Path(__file__).resolve().parent / "outputs" / "inference_predictions.csv"
 
 
-def main() -> None:
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"模型文件不存在，请先训练: {MODEL_PATH}")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run batch inference with a trained random forest regressor.")
+    parser.add_argument(
+        "--data-path",
+        type=Path,
+        default=DATA_PATH,
+        help="Input CSV path for inference. Defaults to randomforest/config.py::DATA_PATH.",
+    )
+    parser.add_argument(
+        "--model-path",
+        type=Path,
+        default=MODEL_PATH,
+        help="Path to a trained model artifact.",
+    )
+    parser.add_argument(
+        "--output-path",
+        type=Path,
+        default=PREDICT_OUTPUT_PATH,
+        help="Path to save inference predictions.",
+    )
+    return parser.parse_args()
 
-    model = joblib.load(MODEL_PATH)
-    df = pd.read_csv(DATA_PATH, encoding="utf-8-sig")
+
+def main() -> None:
+    args = parse_args()
+    if not args.model_path.exists():
+        raise FileNotFoundError(f"模型文件不存在，请先训练: {args.model_path}")
+
+    model = joblib.load(args.model_path)
+    df = pd.read_csv(args.data_path, encoding="utf-8-sig")
 
     # 和训练时保持一致，避免训练-推理特征不一致。
     if ENABLE_TEMPORAL_FILTER:
@@ -52,6 +79,7 @@ def main() -> None:
             feature_cols = [c for c in MANUAL_FEATURE_COLUMNS if c != TARGET_COLUMN]
         else:
             feature_cols = [c for c in df.columns if c != TARGET_COLUMN]
+    feature_cols = [c for c in feature_cols if not str(c).startswith(META_PREFIX)]
 
     X = df[feature_cols].copy()
     for col in X.columns:
@@ -63,11 +91,13 @@ def main() -> None:
     out_df = df.copy()
     out_df["rf_prediction"] = preds
 
-    PREDICT_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    out_df.to_csv(PREDICT_OUTPUT_PATH, index=False, encoding="utf-8-sig")
+    args.output_path.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(args.output_path, index=False, encoding="utf-8-sig")
 
     print("推理完成。")
-    print(f"输出文件: {PREDICT_OUTPUT_PATH}")
+    print(f"输入文件: {args.data_path}")
+    print(f"模型文件: {args.model_path}")
+    print(f"输出文件: {args.output_path}")
 
 
 if __name__ == "__main__":

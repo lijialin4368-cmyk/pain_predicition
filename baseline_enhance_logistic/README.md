@@ -1,70 +1,71 @@
 # Enhanced Logistic README
 
 ## 目录说明
-这个目录现在保存了四个增强版 logistic 类模型脚本：
+这个目录现在包含四个增强版 pain logistic 脚本：
 
 - `1_logistic_regression.py`
 - `2_train_logistic_regression.py`
 - `3_pain_logistic.py`
 - `3_1_pain_logistic.py`
 
-它们都围绕术后疼痛/相关结局预测展开，但建模方式已经分成两条路线：
+它们都服务于同一个大方向：围绕术后结局做疼痛风险预测，但不同版本在建模目标、阈值策略、是否使用增强数据、以及对高痛样本的处理方式上逐步增强。
 
-- `1` / `2`: 先把原始结局离散化成二分类标签，再直接学习高风险概率
-- `3`: 对 pain 任务先保留真实分数做训练，再把预测分数映射成高痛概率
-
-如果把兄弟目录 `baseline/` 里的基础版一起算上，目前可以视为五套模型：
+和兄弟目录 `baseline/` 中的基础版一起看，目前可以理解为五套主要方案：
 
 - baseline: 线性 logistic regression
 - enhance v1: 三层非线性网络 + shared backbone + focal loss / day-relaxed threshold
-- enhance v2: 在 v1 基础上增加 task-adaptive threshold
-- enhance v3: pain-only 分数回归 + 概率映射 + conservative threshold tuning
-- enhance v3.1: 在 v3 基础上增加高痛辅助分类损失和训练 loss 曲线导出
+- enhance v2: 在 v1 基础上进一步加入 task-adaptive threshold
+- enhance v3: 疼痛分数回归 + 概率映射 + conservative threshold tuning
+- enhance v3.1: 在 v3 基础上加入 auxiliary high-pain classification loss，并支持增强数据平衡采样
 
-## 共同背景
-`baseline`、`1`、`2` 的共同点是：
+## 共同任务定义
+增强版模型的核心目标，是围绕术后多天的多个结局做预测。不同脚本对标签的处理方式不完全相同：
 
-- 最终目标仍然是对高风险样本做 `0/1` 判断
-- 最终都会输出概率，再通过阈值变成分类结果
+- `1` 和 `2` 主要直接围绕二分类标签训练
+- `3` 和 `3.1` 先回归原始疼痛分数，再把预测分数映射为高痛概率，最后通过阈值转成分类
 
-但它们对 label 的处理方式不同。
+支持的结局日：
 
-### 路线 A：先二值化再训练
-适用于：
+- `手术当天`
+- `术后第一天`
+- `术后第二天`
+- `术后第三天`
 
-- `baseline/final_baseline_logistic_re/train_logistic_regression.py`
-- `1_logistic_regression.py`
-- `2_train_logistic_regression.py`
+增强版整体支持的结局指标：
 
-规则如下：
+- `静息痛`
+- `活动痛`
+- `镇静评分`
+- `活动状态`
+- `恶心呕吐`
+
+其中：
+
+- `1` 和 `2` 面向更完整的多任务结局集合
+- `3` 和 `3.1` 目前只做 `静息痛` 与 `活动痛` 两类 pain-only 任务
+
+统一的高痛标签规则：
 
 - `静息痛` / `活动痛`: `0-3 -> class 0`, `>=4 -> class 1`
 - `镇静评分`: `1-2 -> class 0`, `3-5 -> class 1`
 - `活动状态`: `1-2 -> class 0`, `3-4 -> class 1`
 - `恶心呕吐`: `0-1 -> class 0`, `2-3 -> class 1`
 
-### 路线 B：先保留真实 pain 分数再训练
-适用于：
+对 `3` 和 `3.1` 来说，这个规则主要用于：
 
-- `3_pain_logistic.py`
+- 从原始疼痛分数导出高痛二分类标签
+- 把回归得到的疼痛分数转换为高痛概率
+- 在验证集上选择最终 decision threshold
 
-这个版本只针对 pain 任务：
+## 模型关系
 
-- `静息痛`
-- `活动痛`
-
-训练时直接保留原始 `0-10` 分数，不先转成二分类标签。
-最终仍然会把预测分数映射成高痛概率，再做 `0/1` 判断。
-
-## 五个模型的关系
-
-| 模型 | 入口脚本 | 核心结构 | 训练目标 | 默认阈值策略 | 适合场景 |
+| 模型 | 入口脚本 | 核心结构 | 默认阈值策略 | 默认输入 | 适合场景 |
 | --- | --- | --- | --- | --- | --- |
-| Baseline | `baseline/final_baseline_logistic_re/train_logistic_regression.py` | 单层线性 logistic regression | 二分类 | `tune` | 做基础对照、保留较强可解释性 |
-| Enhance v1 | `baseline_enhance_logistic/1_logistic_regression.py` | 三层网络，支持 shared backbone multitask | 二分类 | `day_relaxed` | 想引入非线性表达和多任务共享 |
-| Enhance v2 | `baseline_enhance_logistic/2_train_logistic_regression.py` | 三层网络，支持 shared backbone multitask | 二分类 | `task_adaptive` | 想把阈值调得更灵活 |
-| Enhance v3 | `baseline_enhance_logistic/3_pain_logistic.py` | 三层网络，pain-only shared backbone | 原始 pain 分数回归 + 概率映射 | `conservative_tune` | 想保留真实 pain 分数训练，同时避免 v2 那种偏激进的阈值策略 |
-| Enhance v3.1 | `baseline_enhance_logistic/3_1_pain_logistic.py` | 三层网络，pain-only shared backbone | 原始 pain 分数回归 + 辅助高痛分类 + 概率映射 | `conservative_tune` | 想在保留真实分数训练的同时，进一步拉回高痛识别能力 |
+| Baseline | `baseline/final_baseline_logistic_re/train_logistic_regression.py` | 单层线性 logistic regression | `tune` | `data_vectorized.csv` | 做基础对照、保留较强可解释性 |
+| Enhance v1 | `baseline_enhance_logistic/1_logistic_regression.py` | 三层网络，支持 shared backbone multitask | `day_relaxed` | `data_vectorized.csv` | 希望引入非线性表达和多任务共享 |
+| Enhance v2 | `baseline_enhance_logistic/2_train_logistic_regression.py` | 三层网络，支持 shared backbone multitask | `task_adaptive` | `data_vectorized.csv` | 希望进一步优化各任务阈值 |
+| Enhance v3 | `baseline_enhance_logistic/3_pain_logistic.py` | 三层网络，直接回归 pain score，再映射为高痛概率 | `conservative_tune` | `data_vectorized.csv` | 关注疼痛分数本身，并希望分类阈值更稳健 |
+| Enhance v3.1 | `baseline_enhance_logistic/3_1_pain_logistic.py` | v3 + auxiliary high-pain classification loss + rare-positive boost | `conservative_tune` | 优先 `data_augmentation/generated/augmented_dataset.csv` | 希望把增强数据、稀有正类和高痛召回一起纳入训练 |
 
 ## 模型 1：`1_logistic_regression.py`
 ### 核心思路
@@ -76,6 +77,19 @@
 - 支持多任务 shared backbone 训练
 - 支持按天放宽阈值的 `day_relaxed` 策略
 - 支持高痛样本权重增强和临床高痛额外损失惩罚
+
+### 结构特点
+这个脚本同时保留了：
+
+- 单任务训练接口 `run_one_target`
+- 多任务 shared-backbone 主流程 `run_shared_backbone_targets`
+
+但在 `main()` 中，默认走的是 shared backbone 多任务训练流程。
+
+另外有一个重要实现细节：
+
+- `SHARED_BACKBONE_METRICS = {"静息痛", "活动痛", "镇静评分", "恶心呕吐"}`
+- 也就是说，虽然总指标列表里有 `活动状态`，但 shared-backbone 主流程里默认不会训练它
 
 ### 默认配置
 - 默认 `feature-mode`: `strong_signal_temporal`
@@ -139,230 +153,229 @@ v2 额外提供：
 
 ## 模型 3：`3_pain_logistic.py`
 ### 核心思路
-这个版本是专门为 pain 任务新增的一条分支，不继续沿用“先二值化再训练”的做法，而是：
+这个版本把问题改成了“先回归疼痛分数，再做高痛分类”。
 
-1. 保留真实 pain 分数作为训练目标
-2. 用三层 shared-backbone 网络预测连续 pain score
-3. 再把预测分数平滑映射成高痛概率
-4. 最后再用阈值完成 `0/1` 判断
+整体流程是：
 
-也就是说，它不是直接回归后就结束，而是把“分数学习”和“高痛概率判定”接在一起。
+1. 只针对 pain-only 目标训练，即 `静息痛` 和 `活动痛`
+2. 模型先输出连续疼痛分数
+3. 再用 `score_to_probability()` 把预测分数映射成“高痛概率”
+4. 最后通过阈值得到 `0/1` 分类结果
 
-### 当前实现范围
-这个版本只处理 pain 任务：
+和前两个版本相比，v3 不再把训练目标直接固定成 hard class，而是显式保留分数尺度信息。
 
-- `静息痛`
-- `活动痛`
+### 默认训练策略
+- 默认任务范围：四天的 `静息痛 + 活动痛`
+- 默认 `feature-mode`: `strong_signal_temporal`
+- 默认回归损失：`huber`
+- 默认隐藏层：`96 / 48`
+- 默认高痛阈值：`pain-threshold=4.0`
+- 默认高痛强化阈值：`high-pain-score-threshold=3.0`
+- 默认阈值策略：`conservative_tune`
+- 默认输出目录：`3_output_prediction_report_en_scoreprob/`
 
-不包含：
+### 高痛强化方式
+v3 在训练阶段对高痛样本做了双重增强：
 
-- `镇静评分`
-- `活动状态`
-- `恶心呕吐`
+- 对高痛样本做额外 oversampling
+- 对高痛样本加更大的 loss weight
 
-### 模型和损失
-`3_pain_logistic.py` 的默认结构和 `1` 基本一致：
+相关默认参数：
 
-- 三层网络
-- 默认 `input -> 96 -> 48 -> score`
-- shared backbone 多任务训练
-- 纯 numpy 手写训练循环
-- mini-batch 梯度下降
-- 支持高痛样本过采样和额外 loss weight
-
-但损失函数改成了回归损失：
-
-- `Huber loss`，默认
-- `MSE`，可选
-
-默认输出不是直接分类概率，而是先输出 `0-10` pain score 预测值。
-
-### 从分数到概率
-这个版本的关键变化是概率定义：
-
-- 网络先输出 `score_pred`
-- 再通过平滑函数映射成高痛概率 `p_high`
-
-形式上可以理解为：
-
-```python
-p_high = sigmoid((score_pred - pain_threshold) / temperature)
-```
-
-默认：
-
-- `pain_threshold = 4.0`
-- `temperature = 1.0`
-
-这使得模型在保留原始分数信息的同时，仍然可以输出“属于高痛类的概率分数”。
+- `high-pain-oversample-factor=2.5`
+- `high-pain-loss-weight=2.0`
+- `positive-weight-mode=balanced`
 
 ### 阈值策略
-这个版本默认不用 `2` 那套更激进的 `task_adaptive`，而是新增了更保守的：
+v3 支持：
 
+- `fixed`
+- `tune`
+- `day_relaxed`
 - `conservative_tune`
 
-它的基本原则是：
+默认的 `conservative_tune` 是在 `day_relaxed` 基线附近做小范围验证集微调，不追求激进改阈值，而是加上这些保护条件：
 
-- 以 `day_relaxed` 为基线
-- 只允许在小范围内调整阈值
-- 只有验证集上出现明确收益时才改
-- 正样本太少时直接保持基线阈值
+- 验证集正样本太少时，直接保留 day-relaxed 基线
+- 限制阈值偏移范围
+- 要求 accuracy 至少达到最小提升
+- 限制 recall 下滑
+- 限制 F1 明显下降
 
-默认相关参数：
+这套设计比单纯 `tune` 更稳，尤其适合小样本或某些天数高痛样本很少的情况。
 
-- `conservative_min_val_pos = 10`
-- `conservative_max_shift = 0.05`
-- `conservative_min_acc_gain = 0.003`
-- `conservative_max_recall_drop = 0.02`
-- `conservative_min_f1_delta = 0.0`
+### 输入与切分
+默认从以下路径顺序寻找输入：
 
-这套策略是为了让 `3` 更像“稳步优化的 v1 pain 版”，而不是继续朝 `2` 那种更强阈值自适应方向走。
+- `pain_prediction/data_vectorized.csv`
+- `baseline_enhance_logistic/data_vectorized.csv`
+- 当前脚本目录下的 `data_vectorized.csv`
 
-### 输出指标
-这个版本会同时输出两类结果：
+数据切分上，v3 采用普通 train/test 划分，不依赖增强数据元信息。
 
-- 回归指标
-  - `MAE`
-  - `RMSE`
-  - test 集真实/预测平均分数
-- 分类指标
-  - `AUC`
-  - `accuracy`
-  - `precision`
-  - `recall`
-  - `specificity`
-  - `F1`
-  - `log loss`
-  - `Brier score`
+### 输出文件
+v3 会在输出目录中汇总保留：
 
-所以它更适合回答两个问题：
-
-- 模型有没有更好地拟合原始 pain score
-- 最终高痛分类有没有因此受益
-
-### 默认配置
-- 默认 `pain-type`: `both`
-- 默认 `feature-mode`: `strong_signal_temporal`
-- 默认 `loss-type`: `huber`
-- 默认 `huber-delta`: `1.0`
-- 默认 `prob-temperature`: `1.0`
-- 默认阈值策略：`conservative_tune`
-- 默认 day thresholds: `0.55,0.50,0.45,0.40`
-- 默认输出目录：`3_output_prediction_report_en_scoreprob/`
+- `prediction_overview_all_targets.csv`
+- `confusion_matrix_prob_all_targets.csv`
+- `confusion_matrix_prob_all_targets.png`
+- `training_acc_all_targets.png`
 
 ### 适合什么时候用
 建议在这些场景使用 v3：
 
-- 你不想在训练前丢掉原始 pain score 信息
-- 你希望模型先学分数，再转成高痛概率
-- 你觉得 `2` 的阈值和提升策略偏激进
-- 你希望得到“回归表现 + 分类表现”双重评估
+- 你觉得疼痛分数本身比硬分类标签更值得保留
+- 你希望高痛分类结果能来自连续 score 的平滑映射
+- 你希望阈值调整更稳，而不是只追求某个验证指标极值
 
 ## 模型 3.1：`3_1_pain_logistic.py`
 ### 核心思路
-`3.1` 是在 `3_pain_logistic.py` 基础上的直接增强版，目标很明确：
+v3.1 是当前 pain-only 路线里更完整的一版，在 v3 基础上新增了三类强化：
 
-- 保留原始 pain score 回归这条主线
-- 同时增加“高痛/非高痛”的辅助分类损失
-- 让模型在学分数的同时，也更关注最终的高痛识别任务
+- 加入 `auxiliary high-pain classification loss`
+- 对 rare positive head 做额外 boost
+- 对增强数据启用平衡采样训练
 
-它适合解决 `3` 常见的问题：
+也就是说，v3.1 仍然保留“回归分数 -> 映射概率 -> 决策阈值”的主链路，但训练时不只看回归误差，还显式让模型学习“是否高痛”这件事。
 
-- MAE / RMSE 还可以
-- 但高痛 recall 偏低
-- accuracy 看起来更高，但其实预测过于保守
+### 默认训练策略
+- 默认任务范围：四天的 `静息痛 + 活动痛`
+- 默认 `feature-mode`: `strong_signal_temporal`
+- 默认回归损失：`huber`
+- 默认 `aux-cls-weight=1.5`
+- 默认阈值策略：`conservative_tune`
+- 默认 `conservative-selection-scope=per_target`
+- 默认 `conservative-min-accuracy=0.60`
+- 默认 `conservative-accuracy-upshift=0.35`
+- 默认输出目录：`3_1_output_prediction_report_en_scoreprob_auxcls/`
+- 默认输入优先级：
+  - `data_augmentation/generated/augmented_dataset.csv`
+  - `data_vectorized.csv`
+  - 当前脚本目录下的 `data_vectorized.csv`
 
-### 相比 v3 的新增内容
-`3.1` 新增了三个关键点：
+### 相比 v3 多出来的关键机制
+#### 1. Auxiliary classification loss
+v3.1 在训练时同时优化两部分：
 
-1. 联合训练目标
-   - 主任务：原始 pain score 回归
-   - 辅助任务：高痛二分类 BCE loss
-2. 可调的辅助分类损失权重
-   - `--aux-cls-weight`
-3. 训练过程中的 loss 曲线导出
-   - `training_loss_all_targets.png`
+- 原始疼痛分数回归损失
+- 高痛二分类 BCE 辅助损失
 
-另外，当前 `3.1` 还加入了面向小样本正类的敏感性增强：
+辅助损失会通过 `aux-cls-weight` 进入总 loss，用来拉近模型对高痛边界的感知。
 
-- 稀有正样本 head 会获得额外权重 boost
-- 稀有正样本对应样本会获得更高采样概率
-- 验证集正样本太少时，会优先尝试更偏 recall 的小幅阈值下调
-- 不同术后天数使用不同增强倍率：手术当天 / POD1 更激进，POD2 / POD3 温和增强
+#### 2. Rare-positive boost
+对于阳性特别少的 target head，v3.1 会根据正样本稀缺程度额外提高该 head 的权重和采样强度，避免模型过度偏向多数类。
 
-### 联合损失
-可以把它理解成：
+默认相关参数：
 
-```python
-total_loss = regression_loss + aux_cls_weight * auxiliary_classification_loss + l2
-```
+- `rare-positive-target-count=80`
+- `rare-positive-boost-power=0.5`
+- `rare-positive-max-boost=3.0`
+- `rare-positive-oversample-boost=2.0`
 
-默认：
+#### 3. Day sensitivity scale
+不同术后日期的高痛敏感度不同，v3.1 内置了按天的 sensitivity scale：
 
-- 回归损失：`Huber loss`
-- 辅助分类损失：`BCE`
-- `aux_cls_weight = 1.0`
+- `手术当天: 1.35`
+- `术后第一天: 1.25`
+- `术后第二天: 1.12`
+- `术后第三天: 1.08`
 
-### 为什么 3.1 可能比 3 更合理
-`3` 的问题在于：
+这个 scale 会参与辅助分类损失的加权，让更关键的早期高痛头获得更高训练关注度。
 
-- 它只直接优化“分数拟合”
-- 但最终评价依然是“高痛分类”
+### 增强数据采样策略
+如果输入数据中带有增强元信息列：
 
-`3.1` 则把这两件事一起纳入训练目标，所以更有机会在：
+- `__meta_is_generated`
+- `__meta_dataset_split`
+- `__meta_source_row_id`
 
-- 保留分数信息
-- 不完全退化成纯二分类
-- 同时把 recall / F1 往回拉
+那么 v3.1 会启用当前项目里约定的增强数据训练规则：
 
-### loss 曲线
-`3.1` 会额外导出一张训练 loss 图：
+- test set 优先直接使用 `__meta_dataset_split == test` 的原始样本
+- 如果没有显式 test 标记，也会强制从原始数据里切 test
+- test set 不使用生成样本
+- train pool 中保留所有“从未被增强过的原始样本”
+- 再从“被增强过的原始样本 + 新增生成样本”组成的 augmented pool 中，随机抽取与前者等量的数据
+- 然后再从这个平衡后的 train pool 中切 validation
 
+这就是之前已经在代码里落地的“原始未增强样本全保留，增强侧等量抽样”的训练模式。
+
+### 阈值策略
+v3.1 与 v3 一样支持：
+
+- `fixed`
+- `tune`
+- `day_relaxed`
+- `conservative_tune`
+
+但 v3.1 在 `conservative_tune` 下额外补了一个低正样本保护分支：
+
+- 当验证集阳性特别少时，只探索向下的小范围阈值移动
+- 同时限制 FPR 上升幅度
+
+并且当前 3.1 的默认优化方向已经进一步调整为：
+
+- 默认走 `per_target` 严格模式，每个 target 单独调阈值
+- 每个 target 的验证集 `accuracy` 都优先要求不低于 `0.60`
+- 在满足这个单目标 accuracy 下限后，再尽量提高高痛样本的 recall
+- 如果 day-relaxed 阈值不够保守，会继续向上搜索更高阈值
+- 对低正样本 target 仍然保留更谨慎的搜索方式
+
+这使得 3.1 更偏向“每个目标先守住基本准确率，再尽量多召回高痛样本”。
+
+### 训练强化默认值
+为了更主动地抓高痛样本，3.1 当前默认把训练强化也同步加重了：
+
+- `high-pain-oversample-factor=4.0`
+- `high-pain-loss-weight=3.0`
+- `aux-cls-weight=1.5`
+- `rare-positive-target-count=80`
+- `rare-positive-oversample-boost=2.0`
+
+这一组默认值对应的就是目前采用的 “方案 B”。
+
+### 低痛保护阈值
+为了避免 `手术当天_活动痛` 和 `术后第一天_活动痛` 在高召回配置下把过多低痛样本误判成高痛，当前 3.1 还额外加了一个 target-specific low-pain guard：
+
+- `手术当天_活动痛`: 先优先搜索能把验证集 `specificity` 控到至少 `0.35` 的更高阈值
+- `术后第一天_活动痛`: 同样优先搜索验证集 `specificity >= 0.35` 的更高阈值
+
+如果在给定搜索范围内达不到这个标准，就退回到“尽量提高 specificity 和 accuracy”的 best-effort 阈值。
+
+这层保护只对这两个活动痛头生效，目的是把“低痛样本被错抓成高痛”的问题先压下来。
+
+### 输出文件
+v3.1 会在输出目录中汇总保留：
+
+- `prediction_overview_all_targets.csv`
+- `confusion_matrix_prob_all_targets.csv`
+- `confusion_matrix_prob_all_targets.png`
+- `training_acc_all_targets.png`
 - `training_loss_all_targets.png`
 
-图中包含：
-
-- `Total Loss`
-- `Regression Loss`
-- `Aux Classification Loss`
-
-这张图主要用于看训练期间：
-
-- 回归主任务是否在下降
-- 辅助分类任务是否在真正起作用
-- 总 loss 是否稳定
-
-### 默认配置
-- 默认 `pain-type`: `both`
-- 默认 `feature-mode`: `strong_signal_temporal`
-- 默认 `loss-type`: `huber`
-- 默认 `huber-delta`: `1.0`
-- 默认 `prob-temperature`: `1.0`
-- 默认 `aux-cls-weight`: `1.0`
-- 默认 `rare-positive-target-count`: `48`
-- 默认 `rare-positive-max-boost`: `3.0`
-- 默认 `rare-positive-oversample-boost`: `1.5`
-- 默认阈值策略：`conservative_tune`
-- 默认输出目录：`3_1_output_prediction_report_en_scoreprob_auxcls/`
+相较 v3，多了一个总训练损失图。
 
 ### 适合什么时候用
 建议在这些场景使用 v3.1：
 
-- 你认可 v3 的“先学真实 pain 分数”思路
-- 但觉得 v3 的高痛 recall 不够好
-- 你希望在回归和分类之间做更平衡的折中
-- 你想看训练过程中总 loss、回归 loss、辅助分类 loss 的变化
+- 你已经开始使用增强数据训练
+- 你希望 test set 严格保持原始数据、且不混入生成样本
+- 你更关心高痛识别能力，尤其是稀有正类任务
+- 你希望在 score regression 之外，再给模型一个显式的 high-pain 分类目标
 
 ## 共同训练特征
-四个增强版在训练实现上有一些共同点：
+这四个增强版在训练实现上有一些共同点：
 
 - 纯 numpy 手写训练循环，不依赖 torch optimizer
 - 手写前向传播、损失和梯度更新
 - mini-batch 梯度下降
-- 支持正类或高痛样本加权
-- 支持高痛样本过采样
 - 支持早停
 - 支持验证集阈值选择
+
+其中：
+
+- `1` / `2` 更偏向直接分类
+- `3` / `3.1` 更偏向分数回归后再映射概率
 
 ## 特征模式说明
 增强版里最常用的是 `strong_signal_temporal`。
@@ -409,20 +422,26 @@ python baseline_enhance_logistic/3_1_pain_logistic.py
 只跑 POD3 的静息痛和活动痛：
 
 ```bash
-python baseline_enhance_logistic/3_pain_logistic.py \
+python baseline_enhance_logistic/3_1_pain_logistic.py \
   --day "术后第三天" \
   --pain-type both
 ```
 
-只跑 POD3 静息痛：
+显式指定原始数据跑 v3.1：
 
 ```bash
-python baseline_enhance_logistic/3_pain_logistic.py \
-  --day "术后第三天" \
-  --pain-type rest
+python baseline_enhance_logistic/3_1_pain_logistic.py \
+  --input data_vectorized.csv
 ```
 
-使用固定阈值：
+使用增强数据跑 v3.1：
+
+```bash
+python baseline_enhance_logistic/3_1_pain_logistic.py \
+  --input data_augmentation/generated/augmented_dataset.csv
+```
+
+指定固定阈值：
 
 ```bash
 python baseline_enhance_logistic/3_pain_logistic.py \
@@ -430,28 +449,23 @@ python baseline_enhance_logistic/3_pain_logistic.py \
   --decision-threshold 0.5
 ```
 
-使用保守阈值微调：
+使用 day-relaxed 阈值：
 
 ```bash
 python baseline_enhance_logistic/3_pain_logistic.py \
-  --threshold-strategy conservative_tune \
-  --conservative-max-shift 0.05 \
-  --conservative-max-recall-drop 0.02
+  --threshold-strategy day_relaxed \
+  --day-thresholds 0.55,0.50,0.45,0.40
 ```
 
-调整分数到概率的映射温度：
-
-```bash
-python baseline_enhance_logistic/3_pain_logistic.py \
-  --prob-temperature 0.8
-```
-
-运行 v3.1，并启用默认辅助分类损失：
+显式使用 conservative_tune：
 
 ```bash
 python baseline_enhance_logistic/3_1_pain_logistic.py \
-  --day "术后第三天" \
-  --pain-type both
+  --threshold-strategy conservative_tune \
+  --conservative-selection-scope per_target \
+  --conservative-min-accuracy 0.60 \
+  --conservative-accuracy-upshift 0.35 \
+  --conservative-max-shift 0.05
 ```
 
 调整辅助分类损失权重：
@@ -461,37 +475,32 @@ python baseline_enhance_logistic/3_1_pain_logistic.py \
   --aux-cls-weight 1.5
 ```
 
-## 输出文件
-其中 `1`、`2`、`3` 会在输出目录中保留四个聚合文件：
+## 输出文件说明
+增强版最终都会在输出目录中保留聚合结果文件，但不同版本略有差异：
 
-- `prediction_overview_all_targets.csv`
-- `confusion_matrix_prob_all_targets.csv`
-- `confusion_matrix_prob_all_targets.png`
-- `training_acc_all_targets.png`
+- `1` / `2`:
+  - `prediction_overview_all_targets.csv`
+  - `confusion_matrix_prob_all_targets.csv`
+  - `confusion_matrix_prob_all_targets.png`
+  - `training_acc_all_targets.png`
+- `3`:
+  - `prediction_overview_all_targets.csv`
+  - `confusion_matrix_prob_all_targets.csv`
+  - `confusion_matrix_prob_all_targets.png`
+  - `training_acc_all_targets.png`
+- `3.1`:
+  - `prediction_overview_all_targets.csv`
+  - `confusion_matrix_prob_all_targets.csv`
+  - `confusion_matrix_prob_all_targets.png`
+  - `training_acc_all_targets.png`
+  - `training_loss_all_targets.png`
 
-其中 `3_pain_logistic.py` 和 `3_1_pain_logistic.py` 的 summary / confusion CSV 里额外包含：
-
-- `mae`
-- `rmse`
-- `mean_true_score_test`
-- `mean_pred_score_test`
-
-当前目录下已有的旧版示例输出：
+当前目录下已有的典型输出示例：
 
 - `1_output_prediction_report_en_after_fix/`
 - `2_output_prediction_report_en_curvecheck/`
-
-`3` 默认会把结果写到：
-
 - `3_output_prediction_report_en_scoreprob/`
-
-`3.1` 默认会把结果写到：
-
 - `3_1_output_prediction_report_en_scoreprob_auxcls/`
-
-另外，`3.1` 会比 `3` 多输出一张 loss 曲线图：
-
-- `training_loss_all_targets.png`
 
 ## 依赖环境
 从项目当前的 `pixi.toml` 看，运行这些脚本至少需要：
@@ -501,7 +510,7 @@ python baseline_enhance_logistic/3_1_pain_logistic.py \
 - `pandas`
 - `matplotlib`
 
-项目环境里也安装了 `scikit-learn`，但这些脚本本身不是依赖 sklearn 的封装训练。
+项目环境里也安装了 `scikit-learn`，但这些增强版脚本主要仍是手写训练流程，不是 sklearn 的封装训练。
 
 ## 使用建议
 如果只是要一个最稳、最容易解释的对照版本：
@@ -512,13 +521,22 @@ python baseline_enhance_logistic/3_1_pain_logistic.py \
 
 - 先跑 enhance v1
 
-如果你想更积极地调阈值：
+如果你已经确认概率输出合理，想把阈值策略继续打磨：
 
-- 再看 enhance v2
+- 再跑 enhance v2
 
-如果你想保留真实 pain 分数训练，同时让阈值策略更克制：
+如果你想显式利用疼痛分数尺度，而不是直接硬分类：
 
-- 优先看 enhance v3
+- 优先跑 enhance v3
+
+如果你已经引入数据增强，希望训练采样规则与当前增强工程保持一致：
+
+- 优先跑 enhance v3.1
+
+## 文档维护约定
+这份 README 现在作为 `baseline_enhance_logistic/` 的总入口说明。
+
+后续如果 `3` 或 `3.1` 的默认训练策略、增强采样规则、输出目录或运行命令继续变化，应同步更新这里，避免 README 和脚本实现脱节。
 
 ## 进一步阅读
 基础版说明见：

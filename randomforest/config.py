@@ -55,6 +55,19 @@ RF_PARAMS = {
     "n_jobs": -1,
 }
 
+USE_HYPERPARAM_SEARCH = True
+RF_SEARCH_N_ITER = 16
+RF_SEARCH_CV = 4
+RF_SEARCH_SCORING = "neg_mean_absolute_error"
+RF_SEARCH_PARAM_DISTRIBUTIONS = {
+    "n_estimators": [300, 500, 700, 900],
+    "max_depth": [None, 8, 12, 16, 24],
+    "min_samples_split": [2, 4, 8, 12],
+    "min_samples_leaf": [1, 2, 4, 6],
+    "max_features": ["sqrt", "log2", 0.4, 0.6, 0.8],
+    "max_samples": [None, 0.7, 0.85],
+}
+
 # =========================
 # 5) 输出目录配置
 # =========================

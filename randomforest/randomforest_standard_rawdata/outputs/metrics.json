@@ -1,0 +1,38 @@
+{
+  "n_samples": 2679,
+  "n_features": 64,
+  "train_size": 2143,
+  "test_size": 536,
+  "train_original_size": 2143,
+  "train_generated_size": 0,
+  "test_original_size": 536,
+  "test_generated_size": 0,
+  "hyperparameter_search": {
+    "enabled": true,
+    "n_iter": 16,
+    "cv_splits": 4,
+    "scoring": "neg_mean_absolute_error",
+    "best_score": -0.49783823905938235,
+    "best_params": {
+      "n_estimators": 500,
+      "min_samples_split": 4,
+      "min_samples_leaf": 2,
+      "max_samples": 0.85,
+      "max_features": 0.6,
+      "max_depth": 8
+    }
+  },
+  "train_sampling_applied": false,
+  "train_sampling_reason": "no_generated_samples",
+  "train_unaugmented_original_available": 0,
+  "train_augmented_original_available": 0,
+  "train_generated_available": 0,
+  "train_augmented_pool_available": 0,
+  "train_unaugmented_original_selected": 0,
+  "train_augmented_original_selected": 0,
+  "train_generated_selected": 0,
+  "train_augmented_pool_selected": 0,
+  "mae": 0.5105328049881246,
+  "rmse": 0.8516830280937933,
+  "r2": 0.40510479441677427
+}

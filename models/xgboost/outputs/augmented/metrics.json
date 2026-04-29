@@ -1,0 +1,41 @@
+{
+  "model_name": "xgboost_regressor",
+  "n_samples": 2679,
+  "n_features": 64,
+  "train_size": 2143,
+  "test_size": 536,
+  "train_original_size": 2143,
+  "train_generated_size": 0,
+  "test_original_size": 536,
+  "test_generated_size": 0,
+  "hyperparameter_search": {
+    "enabled": true,
+    "n_iter": 16,
+    "cv_splits": 4,
+    "scoring": "neg_mean_absolute_error",
+    "best_score": -0.5035079838662289,
+    "best_params": {
+      "subsample": 0.8,
+      "reg_lambda": 0.5,
+      "reg_alpha": 0.0,
+      "n_estimators": 300,
+      "min_child_weight": 1,
+      "max_depth": 4,
+      "learning_rate": 0.03,
+      "colsample_bytree": 0.6
+    }
+  },
+  "train_sampling_applied": false,
+  "train_sampling_reason": "no_generated_samples",
+  "train_unaugmented_original_available": 0,
+  "train_augmented_original_available": 0,
+  "train_generated_available": 0,
+  "train_augmented_pool_available": 0,
+  "train_unaugmented_original_selected": 0,
+  "train_augmented_original_selected": 0,
+  "train_generated_selected": 0,
+  "train_augmented_pool_selected": 0,
+  "mae": 0.5198958545311618,
+  "rmse": 0.8568901574386889,
+  "r2": 0.39780826336753705
+}

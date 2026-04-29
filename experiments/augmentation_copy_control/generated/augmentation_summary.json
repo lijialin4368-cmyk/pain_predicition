@@ -1,0 +1,32 @@
+{
+  "comparison_strategy": "direct_duplicate",
+  "reference_summary_path": "/home/maolab-data/disk1/jlli/pain_prediction/experiments/augmentation/generated/augmentation_summary.json",
+  "reference_generated_rows": 5662,
+  "reference_generated_rule_counts": {
+    "high_pain_original_jitter": 2718,
+    "high_pain_upshift_jitter": 2842,
+    "movement_wave_down": 44,
+    "movement_wave_up": 44,
+    "rest_wave_down": 7,
+    "rest_wave_up": 7
+  },
+  "reference_augmented_parent_rows": 574,
+  "train_original_rows": 2151,
+  "validation_original_rows": 269,
+  "test_original_rows": 269,
+  "generated_rows": 5662,
+  "final_rows": 8351,
+  "generated_to_original_ratio": 2.6322640632264065,
+  "generated_fraction_in_training": 0.7246896198643287,
+  "duplicate_count_per_parent_min": 2,
+  "duplicate_count_per_parent_max": 14,
+  "duplicate_count_per_parent_mean": 9.86411149825784,
+  "reference_summary_excerpt": {
+    "source_rows": 2689,
+    "train_original_rows": 2151,
+    "validation_original_rows": 269,
+    "test_original_rows": 269,
+    "generated_rows": 5662,
+    "final_rows": 8351
+  }
+}

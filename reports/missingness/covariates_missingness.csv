@@ -1,0 +1,15 @@
+﻿column_cn,column_en,missing_count,missing_ratio
+阻滞镇痛用药,Block Drugs,1967,0.7314986984008925
+阻滞镇痛部位,Block Site,1957,0.7277798438081071
+镇痛泵配方,Pump Formula,383,0.14243213090368168
+镇痛方式,Analgesia Mode,342,0.12718482707326143
+体重,Weight (kg),78,0.02900706582372629
+麻醉方法,Anesthesia Method,35,0.013015991074748977
+ASA分级,ASA Grade,32,0.01190033469691335
+手术日期,Surgery Date,1,0.0003718854592785422
+手术月份,Surgery Month,1,0.0003718854592785422
+手术星期,Surgery Weekday,1,0.0003718854592785422
+年份,Year,0,0.0
+性别,Sex,0,0.0
+年龄,Age,0,0.0
+手术名称,Surgery Name,0,0.0

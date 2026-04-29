@@ -1,0 +1,75 @@
+"""随机森林回归任务配置文件。
+
+你通常只需要改这个文件，不需要直接改训练逻辑。
+"""
+
+from pathlib import Path
+
+# =========================
+# 1) 数据路径配置
+# =========================
+# 可以改成其他你准备好的特征表。
+DATA_PATH = Path(__file__).resolve().parents[2] / "data" / "processed" / "data_vectorized.csv"
+
+# =========================
+# 2) 目标列配置
+# =========================
+# 随机森林是回归模型，因此目标列应为数值型。
+# 你可以改成任何一个你关心的疼痛评分列，例如：
+# "术后第一天_静息痛"、"术后第二天_活动痛" 等。
+TARGET_COLUMN = "术后第一天_静息痛"
+
+# 如果你希望手动指定特征列，可在这里填列名列表；默认 None 表示自动使用“除目标列外的所有列”。
+MANUAL_FEATURE_COLUMNS = None
+
+# 是否启用“时间防泄漏”过滤。
+# True: 仅允许使用“目标时点之前”的时间列（严格过去时信息）。
+# 例如目标是“术后第一天_静息痛”，则可用“手术当天_*”，不可用“术后第一天/第二天/第三天_*”。
+ENABLE_TEMPORAL_FILTER = True
+
+# True 表示严格只用过去时点；False 表示允许用到目标当天时点。
+# 按你的要求，默认 True（更严格，避免同日/未来信息泄漏）。
+STRICT_PAST_ONLY = True
+
+# =========================
+# 3) 训练/验证拆分配置
+# =========================
+TEST_SIZE = 0.1
+RANDOM_STATE = 42
+
+# =========================
+# 4) 随机森林超参数（你最常调的地方）
+# =========================
+RF_PARAMS = {
+    # 树的数量：越大通常越稳，但训练更慢。
+    "n_estimators": 400,
+    # 树最大深度：None 表示不限制，容易更复杂也更容易过拟合。
+    "max_depth": None,
+    # 内部节点再划分最小样本数：调大可抑制过拟合。
+    "min_samples_split": 2,
+    # 叶子节点最小样本数：调大可让模型更平滑。
+    "min_samples_leaf": 1,
+    # 每次分裂考虑的特征数："sqrt" 常见且稳健。
+    "max_features": "sqrt",
+    # 并行训练线程数：-1 表示使用全部CPU核心。
+    "n_jobs": -1,
+}
+
+USE_HYPERPARAM_SEARCH = True
+RF_SEARCH_N_ITER = 16
+RF_SEARCH_CV = 4
+RF_SEARCH_SCORING = "neg_mean_absolute_error"
+RF_SEARCH_PARAM_DISTRIBUTIONS = {
+    "n_estimators": [300, 500, 700, 900],
+    "max_depth": [None, 8, 12, 16, 24],
+    "min_samples_split": [2, 4, 8, 12],
+    "min_samples_leaf": [1, 2, 4, 6],
+    "max_features": ["sqrt", "log2", 0.4, 0.6, 0.8],
+    "max_samples": [None, 0.7, 0.85],
+}
+
+# =========================
+# 5) 输出目录配置
+# =========================
+ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts" / "raw"
+OUTPUT_DIR = Path(__file__).resolve().parent / "outputs" / "raw"

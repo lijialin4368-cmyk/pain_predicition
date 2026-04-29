@@ -1,0 +1,7 @@
+﻿rule,count
+high_pain_original_jitter,2718
+high_pain_upshift_jitter,2842
+movement_wave_down,44
+movement_wave_up,44
+rest_wave_down,7
+rest_wave_up,7

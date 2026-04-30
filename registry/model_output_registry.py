@@ -332,7 +332,9 @@ def _metrics_record_from_json(path: Path, project_dir: Path) -> dict:
 def _overview_records_from_csv(path: Path, project_dir: Path) -> list[dict]:
     rel_parts = path.relative_to(project_dir).parts
     run_name = _infer_run_name(rel_parts)
-    group_name = "raw" if rel_parts[:3] == ("models", rel_parts[1] if len(rel_parts) > 1 else "", "outputs") else run_name
+    group_name = run_name
+    if len(rel_parts) >= 4 and rel_parts[0] == "models" and rel_parts[2] == "outputs":
+        group_name = "raw" if rel_parts[3].endswith(".csv") else rel_parts[3]
     output_dir = path.parent
     records: list[dict] = []
 

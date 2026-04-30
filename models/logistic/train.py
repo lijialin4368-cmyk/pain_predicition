@@ -91,6 +91,11 @@ TOTAL_OUTPUT_FILES = {
     "confusion_matrix_prob_all_targets.png",
     "training_acc_all_targets.png",
 }
+META_PREFIX = "__meta_"
+META_SPLIT_COL = "__meta_dataset_split"
+TRAIN_SPLIT_VALUE = "train"
+VALIDATION_SPLIT_VALUE = "validation"
+TEST_SPLIT_VALUE = "test"
 
 
 def parse_args():
@@ -106,6 +111,12 @@ def parse_args():
         description="Train logistic regression model(s) for outcome binary classification."
     )
     parser.add_argument("--input", type=Path, default=default_input, help="Input CSV path.")
+    parser.add_argument(
+        "--data-path",
+        type=Path,
+        dest="input",
+        help="Alias for --input, matching the regression training scripts.",
+    )
     parser.add_argument(
         "--day",
         type=str,
@@ -289,26 +300,26 @@ def select_feature_columns(df: pd.DataFrame, target_col: str, feature_mode: str)
 
     if feature_mode == "strict":
         if target_col in outcome_cols:
-            return [c for c in df.columns if c not in outcome_cols]
-        return [c for c in df.columns if c != target_col]
-
-    if feature_mode == "all":
-        return [c for c in df.columns if c != target_col]
-
-    # temporal mode:
-    # use all non-outcome features + only outcome features from earlier days.
-    target_day_idx = get_outcome_day_index(target_col)
-    feature_cols = []
-    for c in df.columns:
-        if c == target_col:
-            continue
-        if c not in outcome_cols:
-            feature_cols.append(c)
-            continue
-        col_day_idx = get_outcome_day_index(c)
-        if target_day_idx is not None and col_day_idx is not None and col_day_idx < target_day_idx:
-            feature_cols.append(c)
-    return feature_cols
+            feature_cols = [c for c in df.columns if c not in outcome_cols]
+        else:
+            feature_cols = [c for c in df.columns if c != target_col]
+    elif feature_mode == "all":
+        feature_cols = [c for c in df.columns if c != target_col]
+    else:
+        # temporal mode:
+        # use all non-outcome features + only outcome features from earlier days.
+        target_day_idx = get_outcome_day_index(target_col)
+        feature_cols = []
+        for c in df.columns:
+            if c == target_col:
+                continue
+            if c not in outcome_cols:
+                feature_cols.append(c)
+                continue
+            col_day_idx = get_outcome_day_index(c)
+            if target_day_idx is not None and col_day_idx is not None and col_day_idx < target_day_idx:
+                feature_cols.append(c)
+    return [c for c in feature_cols if not str(c).startswith(META_PREFIX)]
 
 
 def prepare_features(df: pd.DataFrame, feature_cols, feature_impute: str):
@@ -882,7 +893,16 @@ def run_one_target(args, df: pd.DataFrame, target_col: str, output_dir: Path):
         raise ValueError(f"Target {target_col} has only one class after missing drop.")
 
     x = x_df.to_numpy(dtype=float)
-    if args.split_file is not None:
+    split_labels = df.loc[valid_mask, META_SPLIT_COL].astype(str).reset_index(drop=True) if META_SPLIT_COL in df.columns else None
+    if split_labels is not None and split_labels.eq(TEST_SPLIT_VALUE).any():
+        train_pos = np.where(split_labels.eq(TRAIN_SPLIT_VALUE).to_numpy())[0]
+        val_pos = np.where(split_labels.eq(VALIDATION_SPLIT_VALUE).to_numpy())[0]
+        test_pos = np.where(split_labels.eq(TEST_SPLIT_VALUE).to_numpy())[0]
+        if len(train_pos) == 0 or len(test_pos) == 0:
+            raise ValueError(
+                f"显式 split 无效: train={len(train_pos)}, validation={len(val_pos)}, test={len(test_pos)}"
+            )
+    elif args.split_file is not None:
         train_pos, val_pos, test_pos = split_positions_from_reference(
             args.split_file, target_col=target_col, split_seed=args.split_seed, row_ids=row_ids
         )
@@ -1056,7 +1076,9 @@ def main():
         raise ValueError("No valid target columns found for current settings.")
 
     print(f"Input file               : {args.input}")
-    if args.split_file is not None:
+    if META_SPLIT_COL in df.columns:
+        print(f"Explicit split column    : {META_SPLIT_COL}")
+    elif args.split_file is not None:
         print(f"Reference split file     : {args.split_file} (seed={args.split_seed})")
     else:
         print(f"Split ratios             : train pool/test={1 - args.test_size:.3f}/{args.test_size:.3f}; val from train pool={args.val_size:.6f}")

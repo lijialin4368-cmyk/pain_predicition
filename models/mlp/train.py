@@ -96,6 +96,11 @@ TOTAL_OUTPUT_FILES = {
     "confusion_matrix_prob_all_targets.png",
     "training_acc_all_targets.png",
 }
+META_PREFIX = "__meta_"
+META_SPLIT_COL = "__meta_dataset_split"
+TRAIN_SPLIT_VALUE = "train"
+VALIDATION_SPLIT_VALUE = "validation"
+TEST_SPLIT_VALUE = "test"
 
 
 def parse_args():
@@ -111,6 +116,12 @@ def parse_args():
         description="Train enhanced 3-layer logistic network model(s) for outcome binary classification."
     )
     parser.add_argument("--input", type=Path, default=default_input, help="Input CSV path.")
+    parser.add_argument(
+        "--data-path",
+        type=Path,
+        dest="input",
+        help="Alias for --input, matching the other model training scripts.",
+    )
     parser.add_argument(
         "--day",
         type=str,
@@ -247,6 +258,11 @@ def parse_args():
         default=7.0,
         help="Pain score >= this value is treated as high-pain for clinical cost.",
     )
+    parser.add_argument(
+        "--single-target",
+        action="store_true",
+        help="Train each selected target independently instead of using the shared-backbone multitask path.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Print training logs.")
     parser.add_argument(
         "--output-dir",
@@ -335,30 +351,30 @@ def select_feature_columns(df: pd.DataFrame, target_col: str, feature_mode: str)
 
     if feature_mode == "strict":
         if target_col in outcome_cols:
-            return [c for c in df.columns if c not in outcome_cols]
-        return [c for c in df.columns if c != target_col]
+            feature_cols = [c for c in df.columns if c not in outcome_cols]
+        else:
+            feature_cols = [c for c in df.columns if c != target_col]
+    elif feature_mode == "all":
+        feature_cols = [c for c in df.columns if c != target_col]
+    else:
+        if feature_mode not in ("temporal", "strong_signal_temporal"):
+            raise ValueError(f"Unsupported feature_mode: {feature_mode}")
 
-    if feature_mode == "all":
-        return [c for c in df.columns if c != target_col]
-
-    if feature_mode not in ("temporal", "strong_signal_temporal"):
-        raise ValueError(f"Unsupported feature_mode: {feature_mode}")
-
-    # temporal / strong_signal_temporal mode:
-    # use all non-outcome features + all outcome features from earlier days.
-    # Example: predict POD2 -> include SurgeryDay + POD1 outcomes as strong signals.
-    target_day_idx = get_outcome_day_index(target_col)
-    feature_cols = []
-    for c in df.columns:
-        if c == target_col:
-            continue
-        if c not in outcome_cols:
-            feature_cols.append(c)
-            continue
-        col_day_idx = get_outcome_day_index(c)
-        if target_day_idx is not None and col_day_idx is not None and col_day_idx < target_day_idx:
-            feature_cols.append(c)
-    return feature_cols
+        # temporal / strong_signal_temporal mode:
+        # use all non-outcome features + all outcome features from earlier days.
+        # Example: predict POD2 -> include SurgeryDay + POD1 outcomes as strong signals.
+        target_day_idx = get_outcome_day_index(target_col)
+        feature_cols = []
+        for c in df.columns:
+            if c == target_col:
+                continue
+            if c not in outcome_cols:
+                feature_cols.append(c)
+                continue
+            col_day_idx = get_outcome_day_index(c)
+            if target_day_idx is not None and col_day_idx is not None and col_day_idx < target_day_idx:
+                feature_cols.append(c)
+    return [c for c in feature_cols if not str(c).startswith(META_PREFIX)]
 
 
 def prepare_features(df: pd.DataFrame, feature_cols, feature_impute: str):
@@ -1287,7 +1303,20 @@ def run_shared_backbone_targets(args, df: pd.DataFrame, targets):
     y_bin_mat = y_bin_mat[any_label_mask]
 
     x_all = x_df.to_numpy(dtype=float)
-    if args.split_file is not None:
+    split_labels = (
+        df.loc[any_label_mask, META_SPLIT_COL].astype(str).reset_index(drop=True)
+        if META_SPLIT_COL in df.columns
+        else None
+    )
+    if split_labels is not None and split_labels.eq(TEST_SPLIT_VALUE).any():
+        train_idx = np.where(split_labels.eq(TRAIN_SPLIT_VALUE).to_numpy())[0]
+        val_idx = np.where(split_labels.eq(VALIDATION_SPLIT_VALUE).to_numpy())[0]
+        test_idx = np.where(split_labels.eq(TEST_SPLIT_VALUE).to_numpy())[0]
+        if len(train_idx) == 0 or len(test_idx) == 0:
+            raise ValueError(
+                f"显式 split 无效: train={len(train_idx)}, validation={len(val_idx)}, test={len(test_idx)}"
+            )
+    elif args.split_file is not None:
         split_target = targets[0] if len(targets) == 1 else SHARED_BACKBONE_SPLIT_TARGET
         train_idx, val_idx, test_idx = split_positions_from_reference(
             args.split_file,
@@ -1448,7 +1477,20 @@ def run_one_target(args, df: pd.DataFrame, target_col: str, output_dir: Path):
         raise ValueError(f"Target {target_col} has only one class after missing drop.")
 
     x = x_df.to_numpy(dtype=float)
-    if args.split_file is not None:
+    split_labels = (
+        df.loc[valid_mask, META_SPLIT_COL].astype(str).reset_index(drop=True)
+        if META_SPLIT_COL in df.columns
+        else None
+    )
+    if split_labels is not None and split_labels.eq(TEST_SPLIT_VALUE).any():
+        train_idx = np.where(split_labels.eq(TRAIN_SPLIT_VALUE).to_numpy())[0]
+        val_idx = np.where(split_labels.eq(VALIDATION_SPLIT_VALUE).to_numpy())[0]
+        test_idx = np.where(split_labels.eq(TEST_SPLIT_VALUE).to_numpy())[0]
+        if len(train_idx) == 0 or len(test_idx) == 0:
+            raise ValueError(
+                f"显式 split 无效: train={len(train_idx)}, validation={len(val_idx)}, test={len(test_idx)}"
+            )
+    elif args.split_file is not None:
         train_idx, val_idx, test_idx = split_positions_from_reference(
             args.split_file, target_col=target_col, split_seed=args.split_seed, row_ids=row_ids
         )
@@ -1630,7 +1672,9 @@ def main():
         raise ValueError("No valid target columns found for current settings.")
 
     print(f"Input file               : {args.input}")
-    if args.split_file is not None:
+    if META_SPLIT_COL in df.columns:
+        print(f"Explicit split column    : {META_SPLIT_COL}")
+    elif args.split_file is not None:
         print(f"Reference split file     : {args.split_file} (seed={args.split_seed})")
     else:
         print(f"Split ratios             : train pool/test={1 - args.test_size:.3f}/{args.test_size:.3f}; val from train pool={args.val_size:.6f}")
@@ -1661,16 +1705,24 @@ def main():
         print(f"Missing targets skipped  : {missing_targets}")
     print(f"Output dir               : {args.output_dir}")
     skipped_not_shared = [t for t in targets if split_day_metric(t)[1] not in SHARED_BACKBONE_METRICS]
-    if skipped_not_shared:
+    use_single_target = args.single_target or len(targets) == 1
+    if skipped_not_shared and not use_single_target:
         print(f"Skipped (not shared set) : {skipped_not_shared}")
     shared_targets = [t for t in targets if split_day_metric(t)[1] in SHARED_BACKBONE_METRICS]
-    print(f"Shared-backbone targets  : {shared_targets}")
-    if len(shared_targets) == 0:
-        raise ValueError("No targets left for shared-backbone training. Adjust --pain-type/--day settings.")
+    if use_single_target:
+        print("Training mode            : single-target")
+    else:
+        print("Training mode            : shared-backbone")
+        print(f"Shared-backbone targets  : {shared_targets}")
+        if len(shared_targets) == 0:
+            raise ValueError("No targets left for shared-backbone training. Adjust --pain-type/--day settings.")
 
     all_rows = []
-    all_results = run_shared_backbone_targets(args, df, shared_targets)
-    if len(all_results) > 0:
+    if use_single_target:
+        all_results = [run_one_target(args, df, target_col=target_col, output_dir=args.output_dir) for target_col in targets]
+    else:
+        all_results = run_shared_backbone_targets(args, df, shared_targets)
+    if len(all_results) > 0 and "oversampling_used" in all_results[0]:
         print(f"Oversampling applied     : {all_results[0].get('oversampling_used', False)}")
     for result in all_results:
         print_result(result)

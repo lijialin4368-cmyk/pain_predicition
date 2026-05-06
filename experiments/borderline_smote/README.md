@@ -37,4 +37,10 @@ __meta_binary_target
 pixi run logistic-train-smote
 ```
 
+使用 MLP：
+
+```bash
+pixi run mlp-train-smote
+```
+
 注意：该数据集只服务于当前目标的二分类风险预测，不应直接作为连续评分回归数据使用。

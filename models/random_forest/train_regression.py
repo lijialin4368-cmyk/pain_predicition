@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
+from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import KFold, RandomizedSearchCV, train_test_split
 from sklearn.pipeline import Pipeline
@@ -98,6 +99,37 @@ def parse_args() -> argparse.Namespace:
         help="Optional reference split CSV. When provided, it overrides random train/test splitting for raw data.",
     )
     parser.add_argument("--split-seed", type=int, default=42, help="Seed key to read from --split-file.")
+    parser.add_argument(
+        "--sample-weight-mode",
+        choices=["none", "high_pain", "focal_residual"],
+        default="none",
+        help="Tail-aware regression weighting. focal_residual does a second RF fit with residual-focused weights.",
+    )
+    parser.add_argument("--high-pain-threshold", type=float, default=4.0)
+    parser.add_argument("--high-pain-weight", type=float, default=2.5)
+    parser.add_argument("--severe-pain-threshold", type=float, default=7.0)
+    parser.add_argument("--severe-pain-weight", type=float, default=4.0)
+    parser.add_argument("--focal-alpha", type=float, default=1.0)
+    parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--max-final-sample-weight", type=float, default=10.0)
+    parser.add_argument(
+        "--enable-quantile-policy",
+        action="store_true",
+        help="Use validation data to choose a continuous RF tree-quantile prediction policy.",
+    )
+    parser.add_argument("--quantile-grid", type=str, default="0.50,0.60,0.70,0.80,0.90")
+    parser.add_argument(
+        "--prediction-policy-metric",
+        choices=["mae", "high_pain_mae", "combined"],
+        default="combined",
+    )
+    parser.add_argument("--tail-mae-weight", type=float, default=0.25)
+    parser.add_argument("--underprediction-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--enable-residual-calibration",
+        action="store_true",
+        help="Fit an isotonic residual calibration layer on validation predictions when it improves validation score.",
+    )
     return parser.parse_args()
 
 
@@ -263,13 +295,25 @@ def build_rf_pipeline(rf_params: dict) -> Pipeline:
     )
 
 
+def fit_rf_pipeline(model: Pipeline, X_train: pd.DataFrame, y_train: pd.Series, sample_weight: np.ndarray | None) -> Pipeline:
+    if sample_weight is None:
+        model.fit(X_train, y_train)
+    else:
+        model.fit(X_train, y_train, model__sample_weight=np.asarray(sample_weight, dtype=float))
+    return model
+
+
 def to_jsonable_scalar(value):
     if isinstance(value, np.generic):
         return value.item()
     return value
 
 
-def run_hyperparameter_search(X_train: pd.DataFrame, y_train: pd.Series) -> tuple[Pipeline, dict, pd.DataFrame]:
+def run_hyperparameter_search(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    sample_weight: np.ndarray | None = None,
+) -> tuple[Pipeline, dict, pd.DataFrame]:
     search_rf_params = dict(RF_PARAMS)
     search_rf_params["n_jobs"] = -1
     pipeline = build_rf_pipeline(search_rf_params)
@@ -287,7 +331,10 @@ def run_hyperparameter_search(X_train: pd.DataFrame, y_train: pd.Series) -> tupl
         verbose=0,
         return_train_score=True,
     )
-    search.fit(X_train, y_train)
+    fit_kwargs = {}
+    if sample_weight is not None:
+        fit_kwargs["model__sample_weight"] = np.asarray(sample_weight, dtype=float)
+    search.fit(X_train, y_train, **fit_kwargs)
 
     best_params = {
         key.replace("model__", ""): to_jsonable_scalar(value)
@@ -303,6 +350,194 @@ def run_hyperparameter_search(X_train: pd.DataFrame, y_train: pd.Series) -> tupl
     }
     cv_results = pd.DataFrame(search.cv_results_).sort_values("rank_test_score").reset_index(drop=True)
     return search.best_estimator_, search_summary, cv_results
+
+
+def build_tail_sample_weight(y_train: pd.Series, args: argparse.Namespace) -> tuple[np.ndarray | None, dict]:
+    mode = args.sample_weight_mode
+    info = {
+        "mode": mode,
+        "high_pain_threshold": float(args.high_pain_threshold),
+        "high_pain_weight": float(args.high_pain_weight),
+        "severe_pain_threshold": float(args.severe_pain_threshold),
+        "severe_pain_weight": float(args.severe_pain_weight),
+        "high_pain_count": int((y_train >= args.high_pain_threshold).sum()),
+        "severe_pain_count": int((y_train >= args.severe_pain_threshold).sum()),
+        "mean_weight": 1.0,
+        "max_weight": 1.0,
+    }
+    if mode == "none":
+        return None, info
+
+    y_arr = np.asarray(y_train, dtype=float)
+    weights = np.ones(len(y_arr), dtype=float)
+    high_weight = max(1.0, float(args.high_pain_weight))
+    severe_weight = max(high_weight, float(args.severe_pain_weight))
+    weights[y_arr >= float(args.high_pain_threshold)] = high_weight
+    weights[y_arr >= float(args.severe_pain_threshold)] = severe_weight
+    info["mean_weight"] = float(np.mean(weights))
+    info["max_weight"] = float(np.max(weights))
+    return weights, info
+
+
+def build_residual_focus_weight(
+    y_true: pd.Series,
+    y_pred: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, dict]:
+    abs_error = np.abs(np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float))
+    positive_scale = abs_error[abs_error > 0]
+    scale = float(np.quantile(positive_scale, 0.75)) if len(positive_scale) else 1.0
+    if not np.isfinite(scale) or scale <= 0:
+        scale = 1.0
+    normalized_error = np.clip(abs_error / scale, 0.0, 5.0)
+    alpha = max(0.0, float(args.focal_alpha))
+    gamma = max(0.0, float(args.focal_gamma))
+    focus_weight = 1.0 + alpha * np.power(normalized_error, gamma)
+    focus_weight = np.clip(focus_weight, 1.0, 10.0)
+    return focus_weight, {
+        "scale": scale,
+        "alpha": alpha,
+        "gamma": gamma,
+        "mean_weight": float(np.mean(focus_weight)),
+        "max_weight": float(np.max(focus_weight)),
+    }
+
+
+def parse_quantile_grid(quantile_grid: str) -> list[float]:
+    quantiles: list[float] = []
+    for item in str(quantile_grid).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        value = float(item)
+        if value > 1.0:
+            value = value / 100.0
+        if 0.0 < value < 1.0:
+            quantiles.append(value)
+    return sorted(set(quantiles))
+
+
+def tree_prediction_matrix(model: Pipeline, X: pd.DataFrame) -> np.ndarray:
+    imputer = model.named_steps["imputer"]
+    rf_model = model.named_steps["model"]
+    X_imputed = imputer.transform(X)
+    return np.column_stack([estimator.predict(X_imputed) for estimator in rf_model.estimators_])
+
+
+def build_prediction_candidates(model: Pipeline, X: pd.DataFrame, quantiles: list[float]) -> dict[str, np.ndarray]:
+    candidates = {"mean": np.asarray(model.predict(X), dtype=float)}
+    if quantiles:
+        tree_preds = tree_prediction_matrix(model, X)
+        for quantile in quantiles:
+            key = f"q{int(round(quantile * 100)):02d}"
+            candidates[key] = np.quantile(tree_preds, quantile, axis=1)
+    return candidates
+
+
+def score_prediction_policy(y_true: pd.Series, y_pred: np.ndarray, args: argparse.Namespace) -> dict:
+    y_arr = np.asarray(y_true, dtype=float)
+    pred_arr = np.asarray(y_pred, dtype=float)
+    mae = float(mean_absolute_error(y_arr, pred_arr))
+    high_mask = y_arr >= float(args.high_pain_threshold)
+    if high_mask.any():
+        high_mae = float(mean_absolute_error(y_arr[high_mask], pred_arr[high_mask]))
+        high_bias = float(np.mean(pred_arr[high_mask] - y_arr[high_mask]))
+        underprediction_penalty = max(0.0, -high_bias)
+    else:
+        high_mae = None
+        high_bias = None
+        underprediction_penalty = 0.0
+
+    if args.prediction_policy_metric == "mae" or high_mae is None:
+        selection_score = mae
+    elif args.prediction_policy_metric == "high_pain_mae":
+        selection_score = high_mae
+    else:
+        selection_score = mae + float(args.tail_mae_weight) * high_mae + float(args.underprediction_weight) * underprediction_penalty
+
+    return {
+        "mae": mae,
+        "high_pain_mae": high_mae,
+        "high_pain_bias": high_bias,
+        "selection_score": float(selection_score),
+    }
+
+
+def choose_prediction_policy(
+    model: Pipeline,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    args: argparse.Namespace,
+) -> tuple[dict, IsotonicRegression | None, pd.DataFrame | None]:
+    base_policy = {
+        "enabled": bool(args.enable_quantile_policy),
+        "name": "mean",
+        "metric": args.prediction_policy_metric,
+        "calibration": "none",
+        "validation_available": int(len(X_val)),
+    }
+    if len(X_val) == 0:
+        return base_policy, None, None
+
+    quantiles = parse_quantile_grid(args.quantile_grid) if args.enable_quantile_policy else []
+    candidates = build_prediction_candidates(model, X_val, quantiles)
+    rows = []
+    best_name = "mean"
+    best_score = None
+    for name, pred in candidates.items():
+        score = score_prediction_policy(y_val, pred, args)
+        row = {"policy": name, "calibration": "none", **score}
+        rows.append(row)
+        if best_score is None or score["selection_score"] < best_score:
+            best_score = score["selection_score"]
+            best_name = name
+
+    chosen_pred = candidates[best_name]
+    calibrator = None
+    calibration_score = None
+    calibration_improved = False
+    if args.enable_residual_calibration and len(X_val) >= 20 and len(np.unique(chosen_pred)) >= 2:
+        candidate_calibrator = IsotonicRegression(out_of_bounds="clip")
+        candidate_calibrator.fit(chosen_pred, np.asarray(y_val, dtype=float))
+        calibrated_pred = candidate_calibrator.predict(chosen_pred)
+        calibration_score = score_prediction_policy(y_val, calibrated_pred, args)
+        rows.append({"policy": best_name, "calibration": "isotonic", **calibration_score})
+        if best_score is None or calibration_score["selection_score"] <= best_score:
+            calibrator = candidate_calibrator
+            best_score = calibration_score["selection_score"]
+            calibration_improved = True
+
+    policy = {
+        **base_policy,
+        "name": best_name,
+        "quantile_grid": quantiles,
+        "calibration": "isotonic" if calibrator is not None else "none",
+        "calibration_improved": calibration_improved,
+        "validation_score": float(best_score) if best_score is not None else None,
+    }
+    if calibration_score is not None:
+        policy["isotonic_validation_score"] = calibration_score
+    return policy, calibrator, pd.DataFrame(rows)
+
+
+def predict_with_policy(
+    model: Pipeline,
+    X: pd.DataFrame,
+    policy: dict,
+    calibrator: IsotonicRegression | None,
+) -> np.ndarray:
+    name = str(policy.get("name") or "mean")
+    if name == "mean":
+        pred = np.asarray(model.predict(X), dtype=float)
+    elif name.startswith("q"):
+        quantile = float(name.removeprefix("q")) / 100.0
+        pred = np.quantile(tree_prediction_matrix(model, X), quantile, axis=1)
+    else:
+        pred = np.asarray(model.predict(X), dtype=float)
+
+    if calibrator is not None:
+        pred = np.asarray(calibrator.predict(pred), dtype=float)
+    return pred
 
 
 def safe_mean(values: np.ndarray):
@@ -365,7 +600,8 @@ def train_and_evaluate(
     source_row_ids: pd.Series,
     split_file: Path | None,
     split_seed: int,
-) -> tuple[Pipeline, dict, pd.DataFrame, pd.DataFrame | None]:
+    args: argparse.Namespace,
+) -> tuple[Pipeline, dict, pd.DataFrame, pd.DataFrame | None, pd.DataFrame | None, dict, IsotonicRegression | None]:
     """拆分数据、训练模型并计算评估指标。"""
     val_idx = pd.Index([])
     explicit_test_mask = split_labels.eq(TEST_SPLIT_VALUE)
@@ -409,21 +645,46 @@ def train_and_evaluate(
     train_idx = pd.Index(train_idx)
 
     X_train = X.loc[train_idx]
+    X_val = X.loc[val_idx]
     X_test = X.loc[test_idx]
     y_train = y.loc[train_idx]
+    y_val = y.loc[val_idx]
     y_test = y.loc[test_idx]
+    train_sample_weight, sample_weight_info = build_tail_sample_weight(y_train, args)
     if USE_HYPERPARAM_SEARCH:
-        model, search_summary, cv_results_df = run_hyperparameter_search(X_train, y_train)
+        model, search_summary, cv_results_df = run_hyperparameter_search(X_train, y_train, train_sample_weight)
     else:
         model = build_rf_pipeline(RF_PARAMS)
-        model.fit(X_train, y_train)
+        fit_rf_pipeline(model, X_train, y_train, train_sample_weight)
         search_summary = {
             "enabled": False,
             "best_params": {k: to_jsonable_scalar(v) for k, v in RF_PARAMS.items()},
         }
         cv_results_df = None
 
-    y_pred = model.predict(X_test)
+    residual_focus_info = None
+    if args.sample_weight_mode == "focal_residual":
+        initial_train_pred = model.predict(X_train)
+        residual_focus_weight, residual_focus_info = build_residual_focus_weight(y_train, initial_train_pred, args)
+        if train_sample_weight is None:
+            final_sample_weight = residual_focus_weight
+        else:
+            final_sample_weight = np.asarray(train_sample_weight, dtype=float) * residual_focus_weight
+        final_sample_weight = np.clip(final_sample_weight, 1.0, max(1.0, float(args.max_final_sample_weight)))
+        final_params = dict(search_summary.get("best_params") or RF_PARAMS)
+        final_params["n_jobs"] = -1
+        model = build_rf_pipeline(final_params)
+        fit_rf_pipeline(model, X_train, y_train, final_sample_weight)
+        sample_weight_info["residual_focus"] = residual_focus_info
+        sample_weight_info["final_mean_weight"] = float(np.mean(final_sample_weight))
+        sample_weight_info["final_max_weight"] = float(np.max(final_sample_weight))
+        search_summary["residual_focus_refit"] = True
+    else:
+        search_summary["residual_focus_refit"] = False
+
+    policy_info, calibrator, policy_candidates_df = choose_prediction_policy(model, X_val, y_val, args)
+    y_pred_mean = model.predict(X_test)
+    y_pred = predict_with_policy(model, X_test, policy_info, calibrator)
 
     # 评估指标：MAE / RMSE / R^2
     metrics = {
@@ -440,6 +701,8 @@ def train_and_evaluate(
         "test_generated_size": int(is_generated.loc[test_idx].eq(1).sum()),
         "hyperparameter_search": search_summary,
         "target_tier": get_target_tier(TARGET_COLUMN),
+        "sample_weighting": sample_weight_info,
+        "prediction_policy": policy_info,
         "train_sampling_applied": bool(train_sampling_info["sampling_applied"]),
         "train_sampling_reason": train_sampling_info["reason"],
         "train_unaugmented_original_available": int(train_sampling_info["unaugmented_original_available"]),
@@ -460,13 +723,14 @@ def train_and_evaluate(
         {
             "y_true": y_test.values,
             "y_pred": y_pred,
+            "y_pred_mean": y_pred_mean,
             "abs_error": np.abs(y_test.values - y_pred),
             "y_true_high_4": (y_test.values >= 4).astype(int),
             "y_pred_high_4": (y_pred >= 4).astype(int),
         }
     )
 
-    return model, metrics, pred_df, cv_results_df
+    return model, metrics, pred_df, cv_results_df, policy_candidates_df, policy_info, calibrator
 
 
 def save_outputs(
@@ -477,6 +741,9 @@ def save_outputs(
     artifact_dir: Path,
     output_dir: Path,
     cv_results_df: pd.DataFrame | None,
+    policy_candidates_df: pd.DataFrame | None,
+    policy_info: dict,
+    calibrator: IsotonicRegression | None,
 ) -> None:
     """保存模型、评估结果和特征重要性。"""
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -485,6 +752,17 @@ def save_outputs(
     # 1) 保存训练后的模型
     model_path = artifact_dir / "rf_regressor.joblib"
     joblib.dump(model, model_path)
+    bundle_path = artifact_dir / "rf_tail_aware_bundle.joblib"
+    joblib.dump(
+        {
+            "model": model,
+            "prediction_policy": policy_info,
+            "calibrator": calibrator,
+            "feature_columns": list(X.columns),
+            "target_column": TARGET_COLUMN,
+        },
+        bundle_path,
+    )
 
     # 2) 保存评估指标
     metrics_path = output_dir / "metrics.json"
@@ -524,13 +802,21 @@ def save_outputs(
         existing_cols = [col for col in keep_cols if col in cv_results_df.columns]
         cv_results_df.loc[:, existing_cols].to_csv(cv_results_path, index=False, encoding="utf-8-sig")
 
+    policy_path = output_dir / "prediction_policy.json"
+    with policy_path.open("w", encoding="utf-8") as f:
+        json.dump(policy_info, f, ensure_ascii=False, indent=2)
+    if policy_candidates_df is not None:
+        policy_candidates_df.to_csv(output_dir / "prediction_policy_candidates.csv", index=False, encoding="utf-8-sig")
+
     print("\n=== 训练完成，文件已保存 ===")
     print(f"模型文件: {model_path}")
+    print(f"增强推理包: {bundle_path}")
     print(f"评估指标: {metrics_path}")
     print(f"预测明细: {pred_path}")
     print(f"特征重要性: {fi_path}")
     if cv_results_df is not None:
         print(f"调参结果: {output_dir / 'rf_search_results.csv'}")
+    print(f"预测策略: {policy_path}")
 
 
 def main() -> None:
@@ -554,7 +840,7 @@ def main() -> None:
     print("增强训练采样策略: 未增强原始样本全保留；从增强池随机抽取等量样本。")
 
     # Step 3) 训练并评估
-    model, metrics, pred_df, cv_results_df = train_and_evaluate(
+    model, metrics, pred_df, cv_results_df, policy_candidates_df, policy_info, calibrator = train_and_evaluate(
         X,
         y,
         is_generated,
@@ -562,8 +848,14 @@ def main() -> None:
         source_row_ids,
         split_file=args.split_file,
         split_seed=args.split_seed,
+        args=args,
     )
-    metrics["model_name"] = "randomforest_regressor"
+    tail_aware_enabled = (
+        args.sample_weight_mode != "none"
+        or bool(args.enable_quantile_policy)
+        or bool(args.enable_residual_calibration)
+    )
+    metrics["model_name"] = "randomforest_tail_aware_regressor" if tail_aware_enabled else "randomforest_regressor"
     metrics["target_column"] = TARGET_COLUMN
     metrics["source_data_path"] = str(args.data_path)
     metrics["output_dir"] = str(args.output_dir)
@@ -572,7 +864,18 @@ def main() -> None:
         print(f"  {k}: {v}")
 
     # Step 4) 保存输出
-    save_outputs(model, metrics, pred_df, X, args.artifact_dir, args.output_dir, cv_results_df)
+    save_outputs(
+        model,
+        metrics,
+        pred_df,
+        X,
+        args.artifact_dir,
+        args.output_dir,
+        cv_results_df,
+        policy_candidates_df,
+        policy_info,
+        calibrator,
+    )
     refresh_model_registry_safely()
 
 

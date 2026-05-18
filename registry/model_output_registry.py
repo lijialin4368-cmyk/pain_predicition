@@ -17,6 +17,7 @@ from pathlib import Path
 REGISTRY_FILENAME = "registry/model_output_registry.csv"
 SUMMARY_FILENAME = "registry/model_results_summary.csv"
 SKIP_PATH_PARTS = {".git", ".pixi", "__pycache__", "tuning_records"}
+UNDEFINED_METRIC = "undefined"
 
 REGISTRY_COLUMNS = [
     "record_origin",
@@ -89,6 +90,10 @@ SUMMARY_COLUMNS = [
     "mae",
     "rmse",
     "r2",
+    "high_pain_recall_at_4",
+    "high_pain_precision_at_4",
+    "high_pain_f1_at_4",
+    "high_pain_subset_mae_at_4",
     "auroc",
     "auprc",
     "recall",
@@ -132,6 +137,99 @@ def _normalize_scalar(value):
     if math.isnan(value) or math.isinf(value):
         return ""
     return value
+
+
+def _is_missing_value(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, float):
+        return math.isnan(value) or math.isinf(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"", "nan", "none", "null"}
+    return False
+
+
+def _first_present(*values):
+    for value in values:
+        if _is_missing_value(value):
+            continue
+        return value
+    return ""
+
+
+def _summary_value(value):
+    return "" if _is_missing_value(value) else value
+
+
+def _safe_float(value):
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if math.isnan(out) or math.isinf(out):
+        return None
+    return out
+
+
+def _safe_division(num: int, den: int):
+    if den <= 0:
+        return UNDEFINED_METRIC
+    return float(num / den)
+
+
+def _f1_from_precision_recall(precision, recall):
+    if precision == UNDEFINED_METRIC or recall == UNDEFINED_METRIC:
+        return UNDEFINED_METRIC
+    if precision + recall == 0:
+        return 0.0
+    return float(2 * precision * recall / (precision + recall))
+
+
+def _high_pain_metrics_from_arrays(y_true: list[float], y_pred: list[float], threshold: float) -> dict:
+    true_high = [value >= threshold for value in y_true]
+    pred_high = [value >= threshold for value in y_pred]
+    tp = sum(1 for t, p in zip(true_high, pred_high) if t and p)
+    fp = sum(1 for t, p in zip(true_high, pred_high) if (not t) and p)
+    fn = sum(1 for t, p in zip(true_high, pred_high) if t and (not p))
+    precision = _safe_division(tp, tp + fp)
+    recall = _safe_division(tp, tp + fn)
+    abs_errors = [abs(t - p) for t, p, is_high in zip(y_true, y_pred, true_high) if is_high]
+    subset_mae = float(sum(abs_errors) / len(abs_errors)) if abs_errors else UNDEFINED_METRIC
+    return {
+        "recall": recall,
+        "precision": precision,
+        "f1": _f1_from_precision_recall(precision, recall),
+        "subset_mae": subset_mae,
+    }
+
+
+def _high_pain_metrics_from_predictions(prediction_path: Path) -> dict:
+    if not prediction_path.exists():
+        return {}
+    y_true: list[float] = []
+    y_pred: list[float] = []
+    try:
+        with prediction_path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                true_value = _safe_float(row.get("y_true"))
+                pred_value = _safe_float(row.get("y_pred"))
+                if true_value is None or pred_value is None:
+                    continue
+                y_true.append(true_value)
+                y_pred.append(pred_value)
+    except Exception:
+        return {}
+    if not y_true:
+        return {}
+    return {
+        "threshold_4": _high_pain_metrics_from_arrays(y_true, y_pred, 4.0),
+        "threshold_5": _high_pain_metrics_from_arrays(y_true, y_pred, 5.0),
+    }
+
+
+def _fallback_high_pain(fallback: dict, threshold_key: str, metric: str):
+    return fallback.get(threshold_key, {}).get(metric, "")
 
 
 def _record_path(path: Path, project_dir: Path) -> str:
@@ -233,6 +331,7 @@ def _metrics_record_from_json(path: Path, project_dir: Path) -> dict:
     dataset_summary = data.get("dataset_summary", {}) if isinstance(data.get("dataset_summary"), dict) else {}
     high_4 = data.get("high_pain_threshold_4", {}) if isinstance(data.get("high_pain_threshold_4"), dict) else {}
     high_5 = data.get("high_pain_threshold_5", {}) if isinstance(data.get("high_pain_threshold_5"), dict) else {}
+    high_fallback = _high_pain_metrics_from_predictions(path.parent / "test_predictions.csv")
     hyper = data.get("hyperparameter_search", {}) if isinstance(data.get("hyperparameter_search"), dict) else {}
 
     record = _blank_record()
@@ -292,14 +391,38 @@ def _metrics_record_from_json(path: Path, project_dir: Path) -> dict:
             "hyperparam_search_scoring": hyper.get("scoring"),
             "hyperparam_search_best_score": hyper.get("best_score"),
             "hyperparam_search_best_params": hyper.get("best_params"),
-            "high_pain_recall_at_4": high_4.get("recall"),
-            "high_pain_precision_at_4": high_4.get("precision"),
-            "high_pain_f1_at_4": high_4.get("f1"),
-            "high_pain_subset_mae_at_4": high_4.get("subset_mae"),
-            "high_pain_recall_at_5": high_5.get("recall"),
-            "high_pain_precision_at_5": high_5.get("precision"),
-            "high_pain_f1_at_5": high_5.get("f1"),
-            "high_pain_subset_mae_at_5": high_5.get("subset_mae"),
+            "high_pain_recall_at_4": _first_present(
+                high_4.get("recall"), data.get("threshold_4_recall"), _fallback_high_pain(high_fallback, "threshold_4", "recall")
+            ),
+            "high_pain_precision_at_4": _first_present(
+                high_4.get("precision"),
+                data.get("threshold_4_precision"),
+                _fallback_high_pain(high_fallback, "threshold_4", "precision"),
+            ),
+            "high_pain_f1_at_4": _first_present(
+                high_4.get("f1"), data.get("threshold_4_f1"), _fallback_high_pain(high_fallback, "threshold_4", "f1")
+            ),
+            "high_pain_subset_mae_at_4": _first_present(
+                high_4.get("subset_mae"),
+                data.get("threshold_4_subset_mae"),
+                _fallback_high_pain(high_fallback, "threshold_4", "subset_mae"),
+            ),
+            "high_pain_recall_at_5": _first_present(
+                high_5.get("recall"), data.get("threshold_5_recall"), _fallback_high_pain(high_fallback, "threshold_5", "recall")
+            ),
+            "high_pain_precision_at_5": _first_present(
+                high_5.get("precision"),
+                data.get("threshold_5_precision"),
+                _fallback_high_pain(high_fallback, "threshold_5", "precision"),
+            ),
+            "high_pain_f1_at_5": _first_present(
+                high_5.get("f1"), data.get("threshold_5_f1"), _fallback_high_pain(high_fallback, "threshold_5", "f1")
+            ),
+            "high_pain_subset_mae_at_5": _first_present(
+                high_5.get("subset_mae"),
+                data.get("threshold_5_subset_mae"),
+                _fallback_high_pain(high_fallback, "threshold_5", "subset_mae"),
+            ),
         }
     )
 
@@ -423,14 +546,18 @@ def _summary_record_from_registry_row(row: dict) -> dict:
         "task": row.get("task_type") or "",
         "target": row.get("target") or row.get("target_column") or "",
         "data_version": row.get("group_name") or row.get("run_name") or "",
-        "mae": row.get("mae") or "",
-        "rmse": row.get("rmse") or "",
-        "r2": row.get("r2") or "",
-        "auroc": row.get("auc") or "",
-        "auprc": row.get("auprc") or "",
-        "recall": row.get("recall") or "",
-        "precision": row.get("precision") or "",
-        "f1": row.get("f1") or "",
+        "mae": _summary_value(row.get("mae")),
+        "rmse": _summary_value(row.get("rmse")),
+        "r2": _summary_value(row.get("r2")),
+        "high_pain_recall_at_4": _summary_value(row.get("high_pain_recall_at_4")),
+        "high_pain_precision_at_4": _summary_value(row.get("high_pain_precision_at_4")),
+        "high_pain_f1_at_4": _summary_value(row.get("high_pain_f1_at_4")),
+        "high_pain_subset_mae_at_4": _summary_value(row.get("high_pain_subset_mae_at_4")),
+        "auroc": _summary_value(row.get("auc")),
+        "auprc": _summary_value(row.get("auprc")),
+        "recall": _summary_value(row.get("recall")),
+        "precision": _summary_value(row.get("precision")),
+        "f1": _summary_value(row.get("f1")),
         "source_file": row.get("source_file") or "",
         "updated_at": row.get("source_mtime_utc") or "",
     }

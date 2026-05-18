@@ -1,0 +1,22 @@
+{
+  "enabled": true,
+  "name": "q70",
+  "metric": "combined",
+  "calibration": "none",
+  "validation_available": 268,
+  "quantile_grid": [
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    0.9
+  ],
+  "calibration_improved": false,
+  "validation_score": 2.2117184481812697,
+  "isotonic_validation_score": {
+    "mae": 0.5926254538355624,
+    "high_pain_mae": 3.3504232086321637,
+    "high_pain_bias": -3.3504232086321637,
+    "selection_score": 2.267837058151644
+  }
+}

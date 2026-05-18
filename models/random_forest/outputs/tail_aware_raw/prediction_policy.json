@@ -1,0 +1,20 @@
+{
+  "enabled": true,
+  "name": "q60",
+  "metric": "combined",
+  "calibration": "isotonic",
+  "validation_available": 268,
+  "quantile_grid": [
+    0.5,
+    0.6,
+    0.7
+  ],
+  "calibration_improved": true,
+  "validation_score": 1.287365060837596,
+  "isotonic_validation_score": {
+    "mae": 0.5910527968015468,
+    "high_pain_mae": 3.4815613201802456,
+    "high_pain_bias": -3.4815613201802456,
+    "selection_score": 1.287365060837596
+  }
+}
